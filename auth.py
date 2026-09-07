@@ -39,31 +39,40 @@ class AuthManager:
         self._passwords: tuple[str, ...] = tuple(passwords)
         self._tarpit_seconds = tarpit_seconds
         self._max_attempts = max_attempts
-        self._pinned: dict[str, str] = {}
-        self._failures: dict[str, int] = {}
+        self._pinned_passwords: dict[str, str] = {}
+        self._attempts: dict[str, int] = {}
 
-    def create_session(self) -> str:
+    def get_or_pin_password(self, client_ip: str) -> str:
+        pinned = self._pinned_passwords.get(client_ip)
+        if pinned is not None:
+            return pinned
+        password = secrets.choice(self._passwords)
+        self._pinned_passwords[client_ip] = password
+        return password
+
+    def create_session(self, client_ip: str) -> str:
+        self.get_or_pin_password(client_ip)
         session_id = uuid4().hex
-        self._pinned[session_id] = secrets.choice(self._passwords)
-        self._failures[session_id] = 0
+        self._attempts[session_id] = 0
         return session_id
 
     async def validate_login(
         self,
+        client_ip: str,
         session_id: str,
         username: str,
         password: str,
     ) -> bool:
-        pinned = self._pinned.get(session_id)
-        if pinned is not None and secrets.compare_digest(password, pinned):
+        _ = username
+        pinned = self.get_or_pin_password(client_ip)
+        if secrets.compare_digest(password, pinned):
             return True
-        if session_id in self._failures:
-            self._failures[session_id] += 1
+        if session_id in self._attempts:
+            self._attempts[session_id] += 1
         await asyncio.sleep(self._tarpit_seconds)
-        if self._failures.get(session_id, 0) >= self._max_attempts:
+        if self._attempts.get(session_id, 0) >= self._max_attempts:
             raise AuthAttemptLimitExceeded(session_id)
         return False
 
     def release_session(self, session_id: str) -> None:
-        self._pinned.pop(session_id, None)
-        self._failures.pop(session_id, None)
+        self._attempts.pop(session_id, None)

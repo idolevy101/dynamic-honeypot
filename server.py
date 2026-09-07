@@ -25,18 +25,30 @@ _DISCONNECT_ERRORS = (
 )
 
 
+def _peer_ip(conn: asyncssh.SSHServerConnection) -> str:
+    peer = conn.get_extra_info("peername")
+    if isinstance(peer, tuple) and peer:
+        return str(peer[0])
+    if isinstance(peer, str) and peer:
+        return peer
+    return "unknown"
+
+
 class HoneypotServer(asyncssh.SSHServer):
     def __init__(self, auth_manager: AuthManager) -> None:
         self._auth = auth_manager
         self._conn: asyncssh.SSHServerConnection | None = None
+        self._client_ip: str | None = None
         self._session_id: str | None = None
 
     def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
         self._conn = conn
-        self._session_id = self._auth.create_session()
+        self._client_ip = _peer_ip(conn)
+        self._session_id = self._auth.create_session(self._client_ip)
 
     def connection_lost(self, exc: Exception | None) -> None:
         self._conn = None
+        self._client_ip = None
         if self._session_id is None:
             return
         self._auth.release_session(self._session_id)
@@ -52,10 +64,11 @@ class HoneypotServer(asyncssh.SSHServer):
         return False
 
     async def validate_password(self, username: str, password: str) -> bool:
-        if self._session_id is None:
+        if self._session_id is None or self._client_ip is None:
             return False
         try:
             return await self._auth.validate_login(
+                self._client_ip,
                 self._session_id,
                 username,
                 password,
