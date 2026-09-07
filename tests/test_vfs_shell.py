@@ -327,3 +327,64 @@ async def test_date_commands_are_not_llm_cached(vfs: VirtualFileSystem) -> None:
 
     assert first.output != second.output
     assert provider.generate_response.call_count == 2
+
+
+async def test_mkdir_creates_directory_visible_in_ls(shell: Shell) -> None:
+    created = await shell.execute("mkdir /tmp/payloads")
+    assert created.output == ""
+    listing = await shell.execute("ls /tmp")
+    assert "payloads" in listing.output.split("  ")
+    nested = await shell.execute("mkdir -p /tmp/payloads/nested/bin")
+    assert nested.output == ""
+    nested_listing = await shell.execute("ls /tmp/payloads/nested")
+    assert "bin" in nested_listing.output.split("  ")
+
+
+async def test_echo_redirect_writes_file_readable_by_cat(shell: Shell) -> None:
+    written = await shell.execute('echo "malware_test" > /tmp/payload.sh')
+    assert written.output == ""
+    contents = await shell.execute("cat /tmp/payload.sh")
+    assert contents.output == "malware_test\n"
+
+
+async def test_append_redirect_preserves_existing_content(shell: Shell) -> None:
+    await shell.execute('echo "malware_test" > /tmp/payload.sh')
+    appended = await shell.execute('echo "stage2" >> /tmp/payload.sh')
+    assert appended.output == ""
+    contents = await shell.execute("cat /tmp/payload.sh")
+    assert contents.output == "malware_test\nstage2\n"
+
+
+async def test_rm_and_rmdir_deletion_edge_cases(shell: Shell) -> None:
+    await shell.execute("mkdir /tmp/stash")
+    await shell.execute('echo "keep" > /tmp/stash/note.txt')
+    await shell.execute('echo "gone" > /tmp/drop.txt')
+
+    nonempty = await shell.execute("rmdir /tmp/stash")
+    assert nonempty.output == "rmdir: failed to remove '/tmp/stash': Directory not empty\n"
+    assert (await shell.execute("ls /tmp/stash")).output.split("  ") == ["note.txt"]
+
+    is_dir = await shell.execute("rm /tmp/stash")
+    assert is_dir.output == "rm: cannot remove '/tmp/stash': Is a directory\n"
+
+    missing = await shell.execute("rm /tmp/nope.txt")
+    assert missing.output == "rm: cannot remove '/tmp/nope.txt': No such file or directory\n"
+    forced = await shell.execute("rm -f /tmp/nope.txt")
+    assert forced.output == ""
+
+    removed_file = await shell.execute("rm /tmp/drop.txt")
+    assert removed_file.output == ""
+    gone = await shell.execute("cat /tmp/drop.txt")
+    assert gone.output == "cat: /tmp/drop.txt: No such file or directory\n"
+
+    await shell.execute("rm /tmp/stash/note.txt")
+    emptied = await shell.execute("rmdir /tmp/stash")
+    assert emptied.output == ""
+    listing = await shell.execute("ls /tmp")
+    assert "stash" not in listing.output.split("  ")
+
+    await shell.execute("mkdir -p /tmp/tree/leaf")
+    recursive = await shell.execute("rm -rf /tmp/tree")
+    assert recursive.output == ""
+    missing_dir = await shell.execute("ls /tmp/tree")
+    assert "No such file or directory" in missing_dir.output

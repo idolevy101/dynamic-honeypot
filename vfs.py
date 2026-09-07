@@ -254,3 +254,75 @@ class VirtualFileSystem:
         existing = directory.children.get(name)
         if existing is None:
             directory.children[name] = VFSFile(name=name, content="", mode=0o644)
+
+    def write_file(self, path: str, content: str, cwd: str, append: bool = False) -> None:
+        abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == "/":
+            raise IsADirectoryError("/")
+        parent = parent_path(abs_path)
+        directory = self.resolve(parent, "/")
+        if not isinstance(directory, VFSDirectory):
+            raise NotADirectoryError(parent)
+        name = abs_path.rsplit("/", 1)[-1]
+        existing = directory.children.get(name)
+        now = datetime.now(timezone.utc)
+        if existing is not None:
+            if isinstance(existing, VFSDirectory):
+                raise IsADirectoryError(abs_path)
+            if not isinstance(existing, VFSFile):
+                raise IsADirectoryError(abs_path)
+            existing.content = existing.content + content if append else content
+            existing.mtime = now
+            return
+        directory.children[name] = VFSFile(name=name, content=content, mode=0o644, mtime=now)
+
+    def mkdir(self, path: str, cwd: str, parents: bool = False, mode: int = 0o755) -> None:
+        abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == "/":
+            if parents:
+                return
+            raise FileExistsError("/")
+        now = datetime.now(timezone.utc)
+        if parents:
+            node: INode = self._root
+            parts = abs_path.strip("/").split("/")
+            for index, part in enumerate(parts):
+                if not isinstance(node, VFSDirectory):
+                    raise NotADirectoryError("/" + "/".join(parts[:index]))
+                child = node.children.get(part)
+                if child is None:
+                    created = VFSDirectory(name=part, mode=mode, mtime=now)
+                    node.children[part] = created
+                    node = created
+                    continue
+                node = child
+            if not isinstance(node, VFSDirectory):
+                raise NotADirectoryError(abs_path)
+            return
+        parent = parent_path(abs_path)
+        try:
+            directory = self.resolve(parent, "/")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(parent) from exc
+        if not isinstance(directory, VFSDirectory):
+            raise NotADirectoryError(parent)
+        name = abs_path.rsplit("/", 1)[-1]
+        if name in directory.children:
+            raise FileExistsError(abs_path)
+        directory.children[name] = VFSDirectory(name=name, mode=mode, mtime=now)
+
+    def remove(self, path: str, cwd: str, recursive: bool = False) -> None:
+        abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == "/":
+            raise OSError("Directory not empty")
+        parent = parent_path(abs_path)
+        directory = self.resolve(parent, "/")
+        if not isinstance(directory, VFSDirectory):
+            raise NotADirectoryError(parent)
+        name = abs_path.rsplit("/", 1)[-1]
+        node = directory.children.get(name)
+        if node is None:
+            raise FileNotFoundError(abs_path)
+        if isinstance(node, VFSDirectory) and node.children and not recursive:
+            raise OSError("Directory not empty")
+        del directory.children[name]

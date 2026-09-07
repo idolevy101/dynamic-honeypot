@@ -91,6 +91,25 @@ _UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset(
 )
 
 
+def _parse_redirection(tokens: Sequence[str]) -> tuple[list[str], str | None, bool]:
+    command: list[str] = []
+    redirect_path: str | None = None
+    append = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in (">", ">>"):
+            if index + 1 >= len(tokens):
+                raise ValueError("bash: syntax error near unexpected token `newline'")
+            redirect_path = tokens[index + 1]
+            append = token == ">>"
+            index += 2
+            continue
+        command.append(token)
+        index += 1
+    return command, redirect_path, append
+
+
 def lookup_static_output(tokens: Sequence[str]) -> str | None:
     """Return a pre-LLM recon template, or None to fall through to the provider."""
     if not tokens:
@@ -137,6 +156,10 @@ class Shell:
             "ls": self._cmd_ls,
             "cat": self._cmd_cat,
             "touch": self._cmd_touch,
+            "echo": self._cmd_echo,
+            "mkdir": self._cmd_mkdir,
+            "rm": self._cmd_rm,
+            "rmdir": self._cmd_rmdir,
             "exit": self._cmd_exit,
             "logout": self._cmd_exit,
         }
@@ -160,6 +183,27 @@ class Shell:
             return CommandResult(f"bash: {exc}")
         if not tokens:
             return CommandResult()
+        try:
+            command_tokens, redirect_path, append = _parse_redirection(tokens)
+        except ValueError as exc:
+            return CommandResult(str(exc))
+        if not command_tokens:
+            return CommandResult()
+        dispatch_line = stripped if redirect_path is None else " ".join(command_tokens)
+        result = await self._dispatch(command_tokens, dispatch_line)
+        if redirect_path is None:
+            return result
+        try:
+            self._vfs.write_file(redirect_path, result.output, self._state.cwd, append=append)
+        except FileNotFoundError:
+            return CommandResult(f"bash: {redirect_path}: No such file or directory")
+        except IsADirectoryError:
+            return CommandResult(f"bash: {redirect_path}: Is a directory")
+        except NotADirectoryError:
+            return CommandResult(f"bash: {redirect_path}: Not a directory")
+        return CommandResult(exit_session=result.exit_session)
+
+    async def _dispatch(self, tokens: list[str], stripped: str) -> CommandResult:
         command, *args = tokens
         handler = self._handlers.get(command)
         if handler is not None:
@@ -260,6 +304,100 @@ class Shell:
                 chunks.append(f"cat: {path}: Is a directory\n")
             except NotADirectoryError:
                 chunks.append(f"cat: {path}: Not a directory\n")
+        return CommandResult("".join(chunks))
+
+    def _cmd_echo(self, args: list[str]) -> CommandResult:
+        return CommandResult(" ".join(args) + "\n")
+
+    def _cmd_mkdir(self, args: list[str]) -> CommandResult:
+        parents = False
+        paths: list[str] = []
+        for arg in args:
+            if arg.startswith("-") and arg != "-":
+                if "p" in arg[1:]:
+                    parents = True
+                continue
+            paths.append(arg)
+        if not paths:
+            return CommandResult(
+                "mkdir: missing operand\nTry 'mkdir --help' for more information."
+            )
+        chunks: list[str] = []
+        for path in paths:
+            try:
+                self._vfs.mkdir(path, self._state.cwd, parents=parents)
+            except FileExistsError:
+                chunks.append(f"mkdir: cannot create directory '{path}': File exists\n")
+            except FileNotFoundError:
+                chunks.append(
+                    f"mkdir: cannot create directory '{path}': No such file or directory\n"
+                )
+            except NotADirectoryError:
+                chunks.append(f"mkdir: cannot create directory '{path}': Not a directory\n")
+        return CommandResult("".join(chunks))
+
+    def _cmd_rm(self, args: list[str]) -> CommandResult:
+        recursive = False
+        force = False
+        paths: list[str] = []
+        for arg in args:
+            if arg.startswith("-") and arg != "-":
+                flags = arg[1:]
+                if "r" in flags or "R" in flags:
+                    recursive = True
+                if "f" in flags:
+                    force = True
+                continue
+            paths.append(arg)
+        if not paths:
+            return CommandResult(
+                "rm: missing operand\nTry 'rm --help' for more information."
+            )
+        chunks: list[str] = []
+        for path in paths:
+            try:
+                if self._vfs.is_dir(path, self._state.cwd) and not recursive:
+                    chunks.append(f"rm: cannot remove '{path}': Is a directory\n")
+                    continue
+                self._vfs.remove(path, self._state.cwd, recursive=recursive)
+            except FileNotFoundError:
+                if not force:
+                    chunks.append(
+                        f"rm: cannot remove '{path}': No such file or directory\n"
+                    )
+            except OSError:
+                chunks.append(f"rm: cannot remove '{path}': Directory not empty\n")
+            except NotADirectoryError:
+                chunks.append(f"rm: cannot remove '{path}': Not a directory\n")
+        return CommandResult("".join(chunks))
+
+    def _cmd_rmdir(self, args: list[str]) -> CommandResult:
+        paths: list[str] = []
+        for arg in args:
+            if arg.startswith("-") and arg != "-":
+                continue
+            paths.append(arg)
+        if not paths:
+            return CommandResult(
+                "rmdir: missing operand\nTry 'rmdir --help' for more information."
+            )
+        chunks: list[str] = []
+        for path in paths:
+            try:
+                if self._vfs.exists(path, self._state.cwd) and not self._vfs.is_dir(
+                    path, self._state.cwd
+                ):
+                    chunks.append(f"rmdir: failed to remove '{path}': Not a directory\n")
+                    continue
+                self._vfs.remove(path, self._state.cwd, recursive=False)
+            except FileNotFoundError:
+                chunks.append(
+                    f"rmdir: failed to remove '{path}': No such file or directory\n"
+                )
+            except OSError:
+                chunks.append(f"rmdir: failed to remove '{path}': Directory not empty\n")
+            except NotADirectoryError:
+                chunks.append(f"rmdir: failed to remove '{path}': Not a directory\n")
         return CommandResult("".join(chunks))
 
     def _cmd_touch(self, args: list[str]) -> CommandResult:
