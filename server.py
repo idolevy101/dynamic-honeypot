@@ -5,12 +5,13 @@ from pathlib import Path
 import asyncssh
 
 from auth import AuthAttemptLimitExceeded, AuthManager
+from shell import Shell
+from vfs import VirtualFileSystem
 
 HOST = "127.0.0.1"
 PORT = 2222
 HOST_KEY_PATH = Path("./ssh_host_key")
 BANNER = "Welcome to Ubuntu 22.04 LTS (GNU/Linux 5.15.0-generic x86_64)"
-PROMPT = "root@ubuntu-srv:~# "
 
 _DISCONNECT_ERRORS = (
     asyncio.IncompleteReadError,
@@ -94,18 +95,28 @@ async def ensure_host_key(path: Path) -> None:
     await asyncio.to_thread(key.write_private_key, path)
 
 
+def _stdout_crlf(text: str) -> str:
+    if not text:
+        return ""
+    return "".join(f"{line}\r\n" for line in text.splitlines())
+
+
 async def handle_client(process: asyncssh.SSHServerProcess[str]) -> None:
+    shell = Shell(VirtualFileSystem())
     try:
         process.stdout.write(f"{BANNER}\r\n")
         while True:
-            process.stdout.write(PROMPT)
+            process.stdout.write(shell.prompt())
             line = await process.stdin.readline()
             if not line:
                 break
-            command = line.rstrip("\r\n")
-            if command == "exit":
+            result = shell.execute(line.rstrip("\r\n"))
+            if result.output:
+                process.stdout.write(_stdout_crlf(result.output))
+            if result.exit_session:
                 break
-            process.stdout.write(f"echo: {command}\r\n")
+    except asyncio.CancelledError:
+        raise
     except _DISCONNECT_ERRORS:
         pass
     finally:
