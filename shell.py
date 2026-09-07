@@ -9,7 +9,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Final, Sequence
 
 from llm import LLMProvider, NullLLMProvider
 from vfs import (
@@ -23,6 +23,75 @@ from vfs import (
 )
 
 _LS_SIX_MONTHS = timedelta(days=183)
+
+_PS_AUX: Final[str] = """\
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root           1  0.0  0.5 167848 11456 ?        Ss   Apr10   0:04 /sbin/init
+root           2  0.0  0.0      0     0 ?        S    Apr10   0:00 [kthreadd]
+root           3  0.0  0.0      0     0 ?        I<   Apr10   0:00 [rcu_gp]
+root          90  0.0  0.3  47896  6912 ?        Ss   Apr10   0:00 /lib/systemd/systemd-journald
+root         119  0.0  0.2  26204  5632 ?        Ss   Apr10   0:00 /lib/systemd/systemd-udevd
+systemd+     176  0.0  0.2  16276  5120 ?        Ss   Apr10   0:00 /lib/systemd/systemd-networkd
+systemd+     198  0.0  0.3  18012  6784 ?        Ss   Apr10   0:00 /lib/systemd/systemd-resolved
+root         241  0.0  0.2  15432  4608 ?        Ss   Apr10   0:00 /usr/sbin/cron -f
+message+     244  0.0  0.1   7568  3456 ?        Ss   Apr10   0:00 /usr/bin/dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+root         258  0.0  0.6  15488 12288 ?        Ss   Apr10   0:00 /usr/sbin/sshd -D
+root         301  0.0  0.1   7372  2688 tty1     Ss+  Apr10   0:00 /sbin/agetty -o -p -- \\u --noclear tty1 linux
+root         412  0.0  0.3  15408  6912 ?        Ss   01:48   0:00 sshd: root@pts/0
+root         418  0.0  0.2   8752  4608 pts/0    Ss   01:48   0:00 -bash
+root         441  0.0  0.1   9804  3584 pts/0    R+   01:49   0:00 ps aux
+"""
+
+_PS_EF: Final[str] = """\
+UID          PID    PPID  C STIME TTY          TIME CMD
+root           1       0  0 Apr10 ?        00:00:04 /sbin/init
+root           2       0  0 Apr10 ?        00:00:00 [kthreadd]
+root           3       2  0 Apr10 ?        00:00:00 [rcu_gp]
+root          90       1  0 Apr10 ?        00:00:00 /lib/systemd/systemd-journald
+root         119       1  0 Apr10 ?        00:00:00 /lib/systemd/systemd-udevd
+systemd+     176       1  0 Apr10 ?        00:00:00 /lib/systemd/systemd-networkd
+systemd+     198       1  0 Apr10 ?        00:00:00 /lib/systemd/systemd-resolved
+root         241       1  0 Apr10 ?        00:00:00 /usr/sbin/cron -f
+message+     244       1  0 Apr10 ?        00:00:00 /usr/bin/dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+root         258       1  0 Apr10 ?        00:00:00 /usr/sbin/sshd -D
+root         301       1  0 Apr10 ?        00:00:00 /sbin/agetty -o -p -- \\u --noclear tty1 linux
+root         412     258  0 01:48 ?        00:00:00 sshd: root@pts/0
+root         418     412  0 01:48 pts/0    00:00:00 -bash
+root         441     418  0 01:49 pts/0    00:00:00 ps -ef
+"""
+
+_DF_H: Final[str] = """\
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           198M  1.1M  197M   1% /run
+/dev/vda1        20G  3.2G   16G  17% /
+tmpfs           990M     0  990M   0% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/vda15      105M  6.1M   99M   6% /boot/efi
+tmpfs           198M  4.0K  198M   1% /run/user/0
+"""
+
+_FREE_M: Final[str] = """\
+               total        used        free      shared  buff/cache   available
+Mem:            1967         248        1421           2         297        1572
+Swap:              0           0           0
+"""
+
+_UPTIME: Final[str] = " 01:49:12 up 14 days,  3:22,  1 user,  load average: 0.00, 0.01, 0.00"
+
+_STATIC_OUTPUTS: Final[dict[tuple[str, ...], str]] = {
+    ("ps", "aux"): _PS_AUX.rstrip("\n"),
+    ("ps", "-ef"): _PS_EF.rstrip("\n"),
+    ("df", "-h"): _DF_H.rstrip("\n"),
+    ("free", "-m"): _FREE_M.rstrip("\n"),
+    ("uptime",): _UPTIME,
+}
+
+
+def lookup_static_output(tokens: Sequence[str]) -> str | None:
+    """Return a pre-LLM recon template, or None to fall through to the provider."""
+    if not tokens:
+        return None
+    return _STATIC_OUTPUTS.get(tuple(tokens))
 
 
 @dataclass
@@ -82,14 +151,17 @@ class Shell:
             return CommandResult()
         command, *args = tokens
         handler = self._handlers.get(command)
-        if handler is None:
-            output = await self._llm_provider.generate_response(
-                stripped,
-                self._state.cwd,
-                self._llm_context(),
-            )
-            return CommandResult(output)
-        return handler(args)
+        if handler is not None:
+            return handler(args)
+        static = lookup_static_output(tokens)
+        if static is not None:
+            return CommandResult(static)
+        output = await self._llm_provider.generate_response(
+            stripped,
+            self._state.cwd,
+            self._llm_context(),
+        )
+        return CommandResult(output)
 
     def _llm_context(self) -> dict[str, Any]:
         try:

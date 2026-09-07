@@ -19,11 +19,14 @@ _LOGGER = logging.getLogger(__name__)
 GROQ_MODEL: Final[str] = "openai/gpt-oss-20b"
 GROQ_TEMPERATURE: Final[float] = 0.1
 GROQ_TIMEOUT_SECONDS: Final[float] = 3.0
+GROQ_MAX_TOKENS: Final[int] = 300
 
 _SYSTEM_PROMPT: Final[str] = """\
-You are an authentic Ubuntu 22.04 LTS bash shell (GNU/Linux 5.15.0-generic x86_64).
-Output raw stdout and/or stderr only. No markdown, no backticks, no conversational filler, no explanations.
-This is a read-only simulation. Typical commands include whoami, uname -a, id, ps, ifconfig, and netstat.
+You are an authentic Ubuntu 22.04 LTS bash shell on a lightweight cloud VM \
+(GNU/Linux 5.15.0-generic x86_64, user root, low memory, few processes).
+Emit concise, realistic raw terminal stdout/stderr only.
+Never use markdown, code fences, backticks, commentary, or explanations.
+This is a read-only simulation. Typical recon commands include whoami, uname -a, and id.
 If a command would modify the system, emit a realistic bash error instead of performing it.
 Never break character.
 
@@ -98,6 +101,7 @@ class GroqProvider(LLMProvider):
                 self._client.chat.completions.create(
                     model=GROQ_MODEL,
                     temperature=GROQ_TEMPERATURE,
+                    max_tokens=GROQ_MAX_TOKENS,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": command},

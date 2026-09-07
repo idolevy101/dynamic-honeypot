@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from llm import NullLLMProvider
-from shell import CommandResult, SessionState, Shell
+from shell import CommandResult, SessionState, Shell, lookup_static_output
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
@@ -254,6 +254,30 @@ async def test_local_commands_do_not_call_llm(vfs: VirtualFileSystem) -> None:
     await shell.execute("cd /tmp")
     await shell.execute("cat /etc/hostname")
     assert provider.calls == []
+
+
+async def test_static_recon_commands_bypass_llm(vfs: VirtualFileSystem) -> None:
+    provider = RecordingLLMProvider()
+    shell = Shell(vfs, llm_provider=provider)
+    cases = (
+        "ps aux",
+        "ps -ef",
+        "df -h",
+        "free -m",
+        "uptime",
+    )
+    for command in cases:
+        result = await shell.execute(command)
+        expected = lookup_static_output(command.split())
+        assert expected is not None
+        assert result.output == expected
+        assert not result.exit_session
+    assert provider.calls == []
+    assert "USER" in (await shell.execute("ps aux")).output
+    assert "/sbin/init" in (await shell.execute("ps -ef")).output
+    assert "Filesystem" in (await shell.execute("df -h")).output
+    assert "Mem:" in (await shell.execute("free -m")).output
+    assert "load average" in (await shell.execute("uptime")).output
 
 
 async def test_unknown_command_uses_injected_provider(vfs: VirtualFileSystem) -> None:

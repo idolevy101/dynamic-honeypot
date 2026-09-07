@@ -5,7 +5,14 @@ from unittest.mock import AsyncMock, MagicMock
 import groq
 import pytest
 
-from llm import GroqProvider, NullLLMProvider, create_llm_provider
+from llm import (
+    GROQ_MAX_TOKENS,
+    GROQ_MODEL,
+    GROQ_TEMPERATURE,
+    GroqProvider,
+    NullLLMProvider,
+    create_llm_provider,
+)
 from vfs import HOSTNAME
 
 
@@ -52,8 +59,13 @@ async def test_groq_provider_returns_model_content() -> None:
     assert output == "root\n"
     client.chat.completions.create.assert_awaited_once()
     kwargs = client.chat.completions.create.await_args.kwargs
-    assert kwargs["model"] == "llama-3.1-8b-instant"
-    assert kwargs["temperature"] == 0.1
+    assert kwargs["model"] == GROQ_MODEL
+    assert kwargs["temperature"] == GROQ_TEMPERATURE
+    assert kwargs["max_tokens"] == GROQ_MAX_TOKENS
+    system_content = kwargs["messages"][0]["content"]
+    assert "markdown" in system_content.lower()
+    assert "code fences" in system_content.lower()
+    assert "lightweight" in system_content.lower()
 
 
 async def test_groq_provider_falls_back_on_api_error() -> None:
