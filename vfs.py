@@ -179,6 +179,11 @@ def build_honeypot_tree() -> VFSDirectory:
     )
 
 
+def create_default_vfs() -> VirtualFileSystem:
+    """Return an isolated default honeypot tree (no shared inode references)."""
+    return VirtualFileSystem()
+
+
 class VirtualFileSystem:
     """In-memory Linux-like filesystem with path resolution relative to a cwd."""
 
@@ -236,3 +241,16 @@ class VirtualFileSystem:
 
     def get(self, path: str, cwd: str) -> INode:
         return self.resolve(path, cwd)
+
+    def touch_file(self, path: str, cwd: str) -> None:
+        """Create an empty file if missing. Existing files and directories are left as-is."""
+        abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == "/":
+            return
+        directory = self.resolve(parent_path(abs_path), "/")
+        if not isinstance(directory, VFSDirectory):
+            raise NotADirectoryError(parent_path(abs_path))
+        name = abs_path.rsplit("/", 1)[-1]
+        existing = directory.children.get(name)
+        if existing is None:
+            directory.children[name] = VFSFile(name=name, content="", mode=0o644)

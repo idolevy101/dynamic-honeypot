@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 
 from auth import AuthAttemptLimitExceeded, AuthManager
 from llm import LLMProvider, create_llm_provider
+from session_manager import SessionManager
 from shell import Shell
-from vfs import VirtualFileSystem
 
 HOST = "127.0.0.1"
 PORT = 2222
@@ -28,8 +28,9 @@ _DISCONNECT_ERRORS = (
 )
 
 
-def _peer_ip(conn: asyncssh.SSHServerConnection) -> str:
-    peer = conn.get_extra_info("peername")
+def _peer_ip(source: object) -> str:
+    getter = getattr(source, "get_extra_info", None)
+    peer = getter("peername") if callable(getter) else None
     if isinstance(peer, tuple) and peer:
         return str(peer[0])
     if isinstance(peer, str) and peer:
@@ -38,8 +39,9 @@ def _peer_ip(conn: asyncssh.SSHServerConnection) -> str:
 
 
 class HoneypotServer(asyncssh.SSHServer):
-    def __init__(self, auth_manager: AuthManager) -> None:
+    def __init__(self, auth_manager: AuthManager, session_manager: SessionManager) -> None:
         self._auth = auth_manager
+        self._sessions = session_manager
         self._conn: asyncssh.SSHServerConnection | None = None
         self._client_ip: str | None = None
         self._session_id: str | None = None
@@ -50,6 +52,10 @@ class HoneypotServer(asyncssh.SSHServer):
         self._session_id = self._auth.create_session(self._client_ip)
 
     def connection_lost(self, exc: Exception | None) -> None:
+        _ = exc
+        ip = self._client_ip
+        if ip is not None:
+            self._sessions.touch(ip)
         self._conn = None
         self._client_ip = None
         if self._session_id is None:
@@ -97,9 +103,12 @@ class HoneypotServer(asyncssh.SSHServer):
             pass
 
 
-def make_server_factory(auth_manager: AuthManager) -> Callable[[], HoneypotServer]:
+def make_server_factory(
+    auth_manager: AuthManager,
+    session_manager: SessionManager,
+) -> Callable[[], HoneypotServer]:
     def factory() -> HoneypotServer:
-        return HoneypotServer(auth_manager)
+        return HoneypotServer(auth_manager, session_manager)
 
     return factory
 
@@ -125,8 +134,11 @@ def _stdout_crlf(text: str) -> str:
 async def handle_client(
     process: asyncssh.SSHServerProcess[str],
     llm_provider: LLMProvider,
+    session_manager: SessionManager,
 ) -> None:
-    shell = Shell(VirtualFileSystem(), llm_provider=llm_provider)
+    client_ip = _peer_ip(process)
+    record = session_manager.get_or_create(client_ip)
+    shell = Shell(record.vfs, llm_provider=llm_provider, llm_cache=record.llm_cache)
     try:
         process.stdout.write(f"{BANNER}\r\n")
         while True:
@@ -144,6 +156,7 @@ async def handle_client(
     except _DISCONNECT_ERRORS:
         pass
     finally:
+        session_manager.touch(client_ip)
         try:
             process.exit(0)
             process.close()
@@ -156,13 +169,18 @@ async def main() -> None:
     load_dotenv()
     await ensure_host_key(HOST_KEY_PATH)
     auth_manager = AuthManager()
+    session_manager = SessionManager()
     llm_provider = create_llm_provider()
     await asyncssh.create_server(
-        make_server_factory(auth_manager),
+        make_server_factory(auth_manager, session_manager),
         HOST,
         PORT,
         server_host_keys=[str(HOST_KEY_PATH)],
-        process_factory=partial(handle_client, llm_provider=llm_provider),
+        process_factory=partial(
+            handle_client,
+            llm_provider=llm_provider,
+            session_manager=session_manager,
+        ),
     )
     await asyncio.Future()
 

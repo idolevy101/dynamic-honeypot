@@ -86,12 +86,20 @@ _STATIC_OUTPUTS: Final[dict[tuple[str, ...], str]] = {
     ("uptime",): _UPTIME,
 }
 
+_UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset(
+    {"date", "timedatectl", "hwclock"}
+)
+
 
 def lookup_static_output(tokens: Sequence[str]) -> str | None:
     """Return a pre-LLM recon template, or None to fall through to the provider."""
     if not tokens:
         return None
     return _STATIC_OUTPUTS.get(tuple(tokens))
+
+
+def _is_cacheable_llm_command(tokens: Sequence[str]) -> bool:
+    return bool(tokens) and tokens[0] not in _UNCACHEABLE_LLM_COMMANDS
 
 
 @dataclass
@@ -117,15 +125,18 @@ class Shell:
         vfs: VirtualFileSystem,
         state: SessionState | None = None,
         llm_provider: LLMProvider | None = None,
+        llm_cache: dict[str, str] | None = None,
     ) -> None:
         self._vfs = vfs
         self._state = state if state is not None else SessionState(home=vfs.home)
         self._llm_provider = llm_provider if llm_provider is not None else NullLLMProvider()
+        self._llm_cache: dict[str, str] = llm_cache if llm_cache is not None else {}
         self._handlers = {
             "pwd": self._cmd_pwd,
             "cd": self._cmd_cd,
             "ls": self._cmd_ls,
             "cat": self._cmd_cat,
+            "touch": self._cmd_touch,
             "exit": self._cmd_exit,
             "logout": self._cmd_exit,
         }
@@ -156,11 +167,16 @@ class Shell:
         static = lookup_static_output(tokens)
         if static is not None:
             return CommandResult(static)
+        cacheable = _is_cacheable_llm_command(tokens)
+        if cacheable and stripped in self._llm_cache:
+            return CommandResult(self._llm_cache[stripped])
         output = await self._llm_provider.generate_response(
             stripped,
             self._state.cwd,
             self._llm_context(),
         )
+        if cacheable:
+            self._llm_cache[stripped] = output
         return CommandResult(output)
 
     def _llm_context(self) -> dict[str, Any]:
@@ -244,6 +260,21 @@ class Shell:
                 chunks.append(f"cat: {path}: Is a directory\n")
             except NotADirectoryError:
                 chunks.append(f"cat: {path}: Not a directory\n")
+        return CommandResult("".join(chunks))
+
+    def _cmd_touch(self, args: list[str]) -> CommandResult:
+        if not args:
+            return CommandResult(
+                "touch: missing file operand\nTry 'touch --help' for more information."
+            )
+        chunks: list[str] = []
+        for path in args:
+            try:
+                self._vfs.touch_file(path, self._state.cwd)
+            except FileNotFoundError:
+                chunks.append(f"touch: cannot touch '{path}': No such file or directory\n")
+            except NotADirectoryError:
+                chunks.append(f"touch: cannot touch '{path}': Not a directory\n")
         return CommandResult("".join(chunks))
 
     def _cmd_exit(self, _args: list[str]) -> CommandResult:

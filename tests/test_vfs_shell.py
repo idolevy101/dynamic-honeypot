@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -253,6 +254,7 @@ async def test_local_commands_do_not_call_llm(vfs: VirtualFileSystem) -> None:
     await shell.execute("ls")
     await shell.execute("cd /tmp")
     await shell.execute("cat /etc/hostname")
+    await shell.execute("touch /tmp/keep")
     assert provider.calls == []
 
 
@@ -293,3 +295,35 @@ async def test_unknown_command_uses_injected_provider(vfs: VirtualFileSystem) ->
     assert context["hostname"] == HOSTNAME
     assert context["user"] == "root"
     assert ".bash_history" in context["listing"]
+
+
+async def test_repeated_dynamic_command_uses_llm_cache(vfs: VirtualFileSystem) -> None:
+    lscpu = (
+        "Architecture:                            x86_64\n"
+        "CPU(s):                                  2\n"
+        "Model name:                              Intel(R) Xeon(R) CPU"
+    )
+    provider = MagicMock()
+    provider.generate_response = AsyncMock(return_value=lscpu)
+    shell = Shell(vfs, llm_provider=provider)
+
+    first = await shell.execute("  lscpu  ")
+    second = await shell.execute("lscpu")
+
+    assert first.output == lscpu
+    assert second.output == first.output
+    provider.generate_response.assert_called_once()
+
+
+async def test_date_commands_are_not_llm_cached(vfs: VirtualFileSystem) -> None:
+    provider = MagicMock()
+    provider.generate_response = AsyncMock(
+        side_effect=["Tue Sep  8 02:08:01 UTC 2026", "Tue Sep  8 02:08:02 UTC 2026"]
+    )
+    shell = Shell(vfs, llm_provider=provider)
+
+    first = await shell.execute("date")
+    second = await shell.execute("date")
+
+    assert first.output != second.output
+    assert provider.generate_response.call_count == 2
