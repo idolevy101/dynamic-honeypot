@@ -1,4 +1,6 @@
 asyncssh
 cryptography
 pytest
+pytest-asyncio
 groq
+python-dotenv

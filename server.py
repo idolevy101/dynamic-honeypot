@@ -1,10 +1,13 @@
 import asyncio
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import asyncssh
+from dotenv import load_dotenv
 
 from auth import AuthAttemptLimitExceeded, AuthManager
+from llm import LLMProvider, create_llm_provider
 from shell import Shell
 from vfs import VirtualFileSystem
 
@@ -111,11 +114,19 @@ async def ensure_host_key(path: Path) -> None:
 def _stdout_crlf(text: str) -> str:
     if not text:
         return ""
-    return "".join(f"{line}\r\n" for line in text.splitlines())
+    lines = text.splitlines()
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        return ""
+    return "".join(f"{line}\r\n" for line in lines)
 
 
-async def handle_client(process: asyncssh.SSHServerProcess[str]) -> None:
-    shell = Shell(VirtualFileSystem())
+async def handle_client(
+    process: asyncssh.SSHServerProcess[str],
+    llm_provider: LLMProvider,
+) -> None:
+    shell = Shell(VirtualFileSystem(), llm_provider=llm_provider)
     try:
         process.stdout.write(f"{BANNER}\r\n")
         while True:
@@ -123,7 +134,7 @@ async def handle_client(process: asyncssh.SSHServerProcess[str]) -> None:
             line = await process.stdin.readline()
             if not line:
                 break
-            result = shell.execute(line.rstrip("\r\n"))
+            result = await shell.execute(line.rstrip("\r\n"))
             if result.output:
                 process.stdout.write(_stdout_crlf(result.output))
             if result.exit_session:
@@ -142,14 +153,16 @@ async def handle_client(process: asyncssh.SSHServerProcess[str]) -> None:
 
 
 async def main() -> None:
+    load_dotenv()
     await ensure_host_key(HOST_KEY_PATH)
     auth_manager = AuthManager()
+    llm_provider = create_llm_provider()
     await asyncssh.create_server(
         make_server_factory(auth_manager),
         HOST,
         PORT,
         server_host_keys=[str(HOST_KEY_PATH)],
-        process_factory=handle_client,
+        process_factory=partial(handle_client, llm_provider=llm_provider),
     )
     await asyncio.Future()
 

@@ -9,7 +9,9 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
+from llm import LLMProvider, NullLLMProvider
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
@@ -45,9 +47,11 @@ class Shell:
         self,
         vfs: VirtualFileSystem,
         state: SessionState | None = None,
+        llm_provider: LLMProvider | None = None,
     ) -> None:
         self._vfs = vfs
         self._state = state if state is not None else SessionState(home=vfs.home)
+        self._llm_provider = llm_provider if llm_provider is not None else NullLLMProvider()
         self._handlers = {
             "pwd": self._cmd_pwd,
             "cd": self._cmd_cd,
@@ -66,7 +70,7 @@ class Shell:
         shown = "~" if cwd == self._state.home else cwd
         return f"root@{HOSTNAME}:{shown}# "
 
-    def execute(self, line: str) -> CommandResult:
+    async def execute(self, line: str) -> CommandResult:
         stripped = line.strip()
         if not stripped:
             return CommandResult()
@@ -79,8 +83,24 @@ class Shell:
         command, *args = tokens
         handler = self._handlers.get(command)
         if handler is None:
-            return CommandResult(f"bash: {command}: command not found")
+            output = await self._llm_provider.generate_response(
+                stripped,
+                self._state.cwd,
+                self._llm_context(),
+            )
+            return CommandResult(output)
         return handler(args)
+
+    def _llm_context(self) -> dict[str, Any]:
+        try:
+            listing = self._vfs.list_dir(".", self._state.cwd)
+        except (FileNotFoundError, NotADirectoryError):
+            listing = []
+        return {
+            "hostname": HOSTNAME,
+            "user": "root",
+            "listing": listing,
+        }
 
     def _cmd_pwd(self, _args: list[str]) -> CommandResult:
         return CommandResult(self._state.cwd)
