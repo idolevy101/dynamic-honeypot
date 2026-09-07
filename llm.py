@@ -16,7 +16,7 @@ import groq
 
 _LOGGER = logging.getLogger(__name__)
 
-GROQ_MODEL: Final[str] = "llama-3.1-8b-instant"
+GROQ_MODEL: Final[str] = "groq/compound-mini"
 GROQ_TEMPERATURE: Final[float] = 0.1
 GROQ_TIMEOUT_SECONDS: Final[float] = 3.0
 
