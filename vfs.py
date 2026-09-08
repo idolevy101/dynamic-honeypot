@@ -234,6 +234,7 @@ class VFSFile(INode):
 
     content: str = ""
     reported_size: int | None = None
+    dynamic: bool = False
 
     @property
     def size(self) -> int:
@@ -344,6 +345,24 @@ _STUB_BINARIES: Final[tuple[str, ...]] = (
 _STUB_SIZE_MIN: Final[int] = 30 * 1024
 _STUB_SIZE_MAX: Final[int] = 800 * 1024
 DEV_NULL: Final[str] = "/dev/null"
+DEV_ZERO: Final[str] = "/dev/zero"
+DEV_URANDOM: Final[str] = "/dev/urandom"
+MAX_FILE_SIZE_BYTES: Final[int] = 10 * 1024 * 1024
+MAX_TOTAL_VFS_BYTES: Final[int] = 50 * 1024 * 1024
+MAX_READ_CHUNK_BYTES: Final[int] = 1024 * 1024
+_INFINITE_DEVICES: Final[frozenset[str]] = frozenset({DEV_ZERO, DEV_URANDOM})
+
+
+class VFSFileTooLargeError(OSError):
+    """Raised when a write would exceed the per-file size limit."""
+
+
+class VFSNoSpaceError(OSError):
+    """Raised when a write would exceed the total dynamic VFS quota."""
+
+
+def _utf8_size(content: str) -> int:
+    return len(content.encode("utf-8"))
 
 
 def _stub_size(name: str) -> int:
@@ -485,10 +504,19 @@ class VirtualFileSystem:
     ) -> None:
         self._root = root if root is not None else build_honeypot_tree()
         self.home = home
+        self._dynamic_bytes_used: int = 0
+        self.max_file_size_bytes: int = MAX_FILE_SIZE_BYTES
+        self.max_total_vfs_bytes: int = MAX_TOTAL_VFS_BYTES
+        self.max_read_chunk_bytes: int = MAX_READ_CHUNK_BYTES
 
     def clone(self) -> VirtualFileSystem:
         """Deep-copy this tree so mutations never leak across sessions."""
-        return VirtualFileSystem(deepcopy(self._root), home=self.home)
+        cloned = VirtualFileSystem(deepcopy(self._root), home=self.home)
+        cloned._dynamic_bytes_used = self._dynamic_bytes_used
+        cloned.max_file_size_bytes = self.max_file_size_bytes
+        cloned.max_total_vfs_bytes = self.max_total_vfs_bytes
+        cloned.max_read_chunk_bytes = self.max_read_chunk_bytes
+        return cloned
 
     def resolve(self, path: str, cwd: str) -> INode:
         """Return the inode at ``path``, raising POSIX-style errors on failure."""
@@ -507,12 +535,27 @@ class VirtualFileSystem:
         return node
 
     def read_file(self, path: str, cwd: str) -> str:
+        abs_path = canonicalize(path, cwd, self.home)
         node = self.resolve(path, cwd)
         if isinstance(node, VFSDirectory):
-            raise IsADirectoryError(canonicalize(path, cwd, self.home))
+            raise IsADirectoryError(abs_path)
         if not isinstance(node, VFSFile):
-            raise FileNotFoundError(canonicalize(path, cwd, self.home))
+            raise FileNotFoundError(abs_path)
+        if node.char_device:
+            return self._read_char_device(abs_path)
         return node.content
+
+    def _read_char_device(self, abs_path: str) -> str:
+        if abs_path == DEV_NULL:
+            return ""
+        if abs_path not in _INFINITE_DEVICES:
+            return ""
+        size = max(self.max_read_chunk_bytes, 0)
+        if size == 0:
+            return ""
+        if abs_path == DEV_ZERO:
+            return "\0" * size
+        return "U" * size
 
     def list_dir(self, path: str, cwd: str) -> list[str]:
         node = self.resolve(path, cwd)
@@ -574,10 +617,46 @@ class VirtualFileSystem:
                 raise IsADirectoryError(abs_path)
             if not isinstance(existing, VFSFile):
                 raise IsADirectoryError(abs_path)
-            existing.content = existing.content + content if append else content
+            if existing.char_device:
+                return
+            new_content = existing.content + content if append else content
+            self._account_write(existing, new_content)
+            existing.content = new_content
+            existing.reported_size = None
+            existing.dynamic = True
             existing.mtime = now
             return
-        directory.children[name] = VFSFile(name=name, content=content, mode=0o644, mtime=now)
+        self._account_write(None, content)
+        directory.children[name] = VFSFile(
+            name=name,
+            content=content,
+            mode=0o644,
+            mtime=now,
+            dynamic=True,
+        )
+
+    def _account_write(self, existing: VFSFile | None, new_content: str) -> None:
+        new_bytes = _utf8_size(new_content)
+        if new_bytes > self.max_file_size_bytes:
+            raise VFSFileTooLargeError("File too large")
+        old_counted = 0
+        if existing is not None and existing.dynamic:
+            old_counted = _utf8_size(existing.content)
+        projected = self._dynamic_bytes_used - old_counted + new_bytes
+        if projected > self.max_total_vfs_bytes:
+            raise VFSNoSpaceError("No space left on device")
+        self._dynamic_bytes_used = projected
+
+    def _release_dynamic_bytes(self, node: INode) -> None:
+        if isinstance(node, VFSFile):
+            if node.dynamic:
+                self._dynamic_bytes_used -= _utf8_size(node.content)
+                if self._dynamic_bytes_used < 0:
+                    self._dynamic_bytes_used = 0
+            return
+        if isinstance(node, VFSDirectory):
+            for child in node.children.values():
+                self._release_dynamic_bytes(child)
 
     def mkdir(self, path: str, cwd: str, parents: bool = False, mode: int = 0o755) -> bool:
         abs_path = canonicalize(path, cwd, self.home)
@@ -642,6 +721,7 @@ class VirtualFileSystem:
             raise FileNotFoundError(abs_path)
         if isinstance(node, VFSDirectory) and not recursive:
             raise IsADirectoryError(abs_path)
+        self._release_dynamic_bytes(node)
         del directory.children[name]
         return True
 
@@ -661,6 +741,7 @@ class VirtualFileSystem:
             raise NotADirectoryError(abs_path)
         if node.children:
             raise OSError("Directory not empty")
+        self._release_dynamic_bytes(node)
         del directory.children[name]
 
     def chmod(self, path: str, mode: str, cwd: str) -> None:

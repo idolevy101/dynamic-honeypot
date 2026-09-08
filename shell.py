@@ -6,6 +6,7 @@ Host OS execution is never used.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import shlex
@@ -20,11 +21,16 @@ from sinkhole import filename_from_url, mocked_payload, quarantine_artifact
 from telemetry import record_command
 from vfs import (
     DEFAULT_HOME,
+    DEV_URANDOM,
+    DEV_ZERO,
     HOSTNAME,
     INode,
     KERNEL_RELEASE,
     KERNEL_VERSION,
     VFSDirectory,
+    VFSFile,
+    VFSFileTooLargeError,
+    VFSNoSpaceError,
     VirtualFileSystem,
     canonicalize,
     parent_path,
@@ -989,19 +995,30 @@ class Shell:
                     except ValueError as exc:
                         result = _fail(str(exc), exit_code=2)
                     else:
-                        if command_tokens:
-                            dispatch_line = (
-                                stripped
-                                if redirect_path is None
-                                else " ".join(command_tokens)
+                        cmd_name = command_tokens[0] if command_tokens else ""
+                        if redirect_path is not None and self._is_infinite_cat(
+                            command_tokens
+                        ):
+                            result = await self._stream_infinite_redirect(
+                                cmd_name,
+                                command_tokens,
+                                redirect_path,
+                                append,
                             )
-                            result, execution_path = await self._dispatch(
-                                command_tokens, dispatch_line, stdin
-                            )
-                        if redirect_path is not None:
-                            result = self._apply_redirection(
-                                result, redirect_path, append
-                            )
+                        else:
+                            if command_tokens:
+                                dispatch_line = (
+                                    stripped
+                                    if redirect_path is None
+                                    else " ".join(command_tokens)
+                                )
+                                result, execution_path = await self._dispatch(
+                                    command_tokens, dispatch_line, stdin
+                                )
+                            if redirect_path is not None:
+                                result = self._apply_redirection(
+                                    result, redirect_path, append, cmd_name
+                                )
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
             await record_command(
@@ -1027,6 +1044,7 @@ class Shell:
         result: CommandResult,
         redirect_path: str,
         append: bool,
+        command_name: str = "",
     ) -> CommandResult:
         try:
             self._vfs.write_file(
@@ -1038,6 +1056,12 @@ class Shell:
             return _fail(f"bash: {redirect_path}: Is a directory")
         except NotADirectoryError:
             return _fail(f"bash: {redirect_path}: Not a directory")
+        except VFSFileTooLargeError:
+            label = command_name or redirect_path
+            return _fail(f"bash: {label}: write error: File too large")
+        except VFSNoSpaceError:
+            label = command_name or redirect_path
+            return _fail(f"bash: {label}: write error: No space left on device")
         name = redirect_path.rstrip("/").rsplit("/", 1)[-1] or redirect_path
         self._quarantine(name, result.output)
         return CommandResult(
@@ -1045,6 +1069,73 @@ class Shell:
             exit_code=result.exit_code,
             execution_path=result.execution_path,
         )
+
+    def _is_infinite_cat(self, tokens: Sequence[str]) -> bool:
+        if not tokens:
+            return False
+        name = tokens[0].rsplit("/", 1)[-1]
+        if name != "cat":
+            return False
+        for arg in tokens[1:]:
+            if arg.startswith("-") and arg != "-":
+                continue
+            abs_path = canonicalize(arg, self._state.cwd, self._state.home)
+            if abs_path in (DEV_ZERO, DEV_URANDOM):
+                return True
+        return False
+
+    async def _stream_infinite_redirect(
+        self,
+        command_name: str,
+        tokens: Sequence[str],
+        redirect_path: str,
+        append: bool,
+    ) -> CommandResult:
+        device: str | None = None
+        for arg in tokens[1:]:
+            if arg.startswith("-") and arg != "-":
+                continue
+            abs_path = canonicalize(arg, self._state.cwd, self._state.home)
+            if abs_path in (DEV_ZERO, DEV_URANDOM):
+                device = arg
+                break
+        if device is None:
+            return self._apply_redirection(
+                CommandResult(), redirect_path, append, command_name
+            )
+        try:
+            dest = self._vfs.resolve(redirect_path, self._state.cwd)
+        except (FileNotFoundError, NotADirectoryError):
+            dest = None
+        if isinstance(dest, VFSFile) and dest.char_device:
+            return CommandResult()
+        chunk = self._vfs.read_file(device, self._state.cwd)
+        if not chunk:
+            return self._apply_redirection(
+                CommandResult(), redirect_path, append, command_name
+            )
+        chunk_bytes = max(len(chunk.encode("utf-8")), 1)
+        max_iters = (self._vfs.max_total_vfs_bytes // chunk_bytes) + 2
+        use_append = append
+        label = command_name or redirect_path
+        try:
+            for _ in range(max_iters):
+                self._vfs.write_file(
+                    redirect_path, chunk, self._state.cwd, append=use_append
+                )
+                use_append = True
+                await asyncio.sleep(0)
+        except VFSFileTooLargeError:
+            return _fail(f"bash: {label}: write error: File too large")
+        except VFSNoSpaceError:
+            return _fail(f"bash: {label}: write error: No space left on device")
+        except FileNotFoundError:
+            return _fail(f"bash: {redirect_path}: No such file or directory")
+        except IsADirectoryError:
+            return _fail(f"bash: {redirect_path}: Is a directory")
+        except NotADirectoryError:
+            return _fail(f"bash: {redirect_path}: Not a directory")
+        return _fail(f"bash: {label}: write error: No space left on device")
 
     def _quarantine(
         self,
@@ -1441,6 +1532,10 @@ class Shell:
             return _fail(f"wget: {target}: Is a directory")
         except NotADirectoryError:
             return _fail(f"wget: {target}: Not a directory")
+        except VFSFileTooLargeError:
+            return _fail("bash: wget: write error: File too large")
+        except VFSNoSpaceError:
+            return _fail("bash: wget: write error: No space left on device")
         name = target.rstrip("/").rsplit("/", 1)[-1] or filename_from_url(url)
         self._quarantine(name, payload, source_url=url)
         return CommandResult(_wget_progress(url, name, len(payload.encode("utf-8"))))
@@ -1464,6 +1559,10 @@ class Shell:
                 return _fail("curl: (23) Failure writing output to destination")
             except NotADirectoryError:
                 return _fail("curl: (23) Failure writing output to destination")
+            except VFSFileTooLargeError:
+                return _fail("bash: curl: write error: File too large")
+            except VFSNoSpaceError:
+                return _fail("bash: curl: write error: No space left on device")
             name = target.rstrip("/").rsplit("/", 1)[-1] or filename_from_url(url)
             self._quarantine(name, payload, source_url=url)
             if parsed.silent:

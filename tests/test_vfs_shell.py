@@ -8,18 +8,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from llm import NullLLMProvider
+from server import handle_client
+from session_manager import SessionManager
 from shell import CommandResult, SessionState, Shell, format_uname, lookup_static_output
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
     ISSUE,
     KERNEL_RELEASE,
+    MAX_FILE_SIZE_BYTES,
+    MAX_TOTAL_VFS_BYTES,
     OS_RELEASE,
     PASSWD,
     PROC_VERSION,
     UNAME_A,
     VFSDirectory,
     VFSFile,
+    VFSFileTooLargeError,
+    VFSNoSpaceError,
     VirtualFileSystem,
     canonicalize,
     create_default_vfs,
@@ -1062,3 +1068,174 @@ async def test_ls_dev_null_is_character_device(shell: Shell) -> None:
     urandom = await shell.execute("ls -l /dev/urandom")
     assert urandom.output.startswith("c")
     assert urandom.output.endswith(" /dev/urandom")
+
+
+def test_quota_constants() -> None:
+    assert MAX_FILE_SIZE_BYTES == 10 * 1024 * 1024
+    assert MAX_TOTAL_VFS_BYTES == 50 * 1024 * 1024
+
+
+def test_vfs_write_over_10mb_raises_file_too_large(vfs: VirtualFileSystem) -> None:
+    with pytest.raises(VFSFileTooLargeError):
+        vfs.write_file("/tmp/huge", "A" * (MAX_FILE_SIZE_BYTES + 1), "/")
+    assert vfs._dynamic_bytes_used == 0
+    assert not vfs.exists("/tmp/huge", "/")
+
+
+def test_static_bin_stubs_do_not_consume_dynamic_quota(vfs: VirtualFileSystem) -> None:
+    assert vfs._dynamic_bytes_used == 0
+    bash = vfs.get("/bin/bash", "/")
+    assert isinstance(bash, VFSFile)
+    assert bash.dynamic is False
+    assert 30 * 1024 <= bash.size <= 800 * 1024
+    usr_bash = vfs.get("/usr/bin/curl", "/")
+    assert isinstance(usr_bash, VFSFile)
+    assert usr_bash.size > 0
+    assert vfs._dynamic_bytes_used == 0
+    vfs.write_file("/tmp/counted.txt", "abc", "/")
+    assert vfs._dynamic_bytes_used == 3
+
+
+def test_vfs_overwrite_adjusts_dynamic_bytes(vfs: VirtualFileSystem) -> None:
+    vfs.write_file("/tmp/delta.txt", "abcd", "/")
+    assert vfs._dynamic_bytes_used == 4
+    vfs.write_file("/tmp/delta.txt", "xy", "/")
+    assert vfs._dynamic_bytes_used == 2
+    vfs.write_file("/tmp/delta.txt", "z", "/", append=True)
+    assert vfs._dynamic_bytes_used == 3
+
+
+def test_vfs_remove_and_rmdir_release_dynamic_bytes(vfs: VirtualFileSystem) -> None:
+    vfs.mkdir("/tmp/stash", "/")
+    vfs.write_file("/tmp/stash/a.txt", "hello", "/")
+    vfs.write_file("/tmp/stash/b.txt", "world!", "/")
+    assert vfs._dynamic_bytes_used == 11
+    vfs.remove("/tmp/stash", "/", recursive=True)
+    assert vfs._dynamic_bytes_used == 0
+    vfs.write_file("/tmp/gone.txt", "xyz", "/")
+    vfs.mkdir("/tmp/empty", "/")
+    assert vfs._dynamic_bytes_used == 3
+    vfs.remove("/tmp/gone.txt", "/")
+    vfs.rmdir("/tmp/empty", "/")
+    assert vfs._dynamic_bytes_used == 0
+
+
+async def test_shell_write_over_file_limit_is_file_too_large(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    vfs.max_file_size_bytes = 32
+    result = await shell.execute("echo " + ("A" * 40) + " > /tmp/huge.txt")
+    assert result.exit_code == 1
+    assert result.output == "bash: echo: write error: File too large\n"
+    assert not vfs.exists("/tmp/huge.txt", "/")
+    status = await shell.execute("echo $?")
+    assert status.output == "1\n"
+
+
+async def test_shell_writes_over_total_quota_is_no_space(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    vfs.max_file_size_bytes = 80
+    vfs.max_total_vfs_bytes = 100
+    first = await shell.execute("echo -n " + ("A" * 50) + " > /tmp/a.txt")
+    assert first.exit_code == 0
+    second = await shell.execute("echo -n " + ("B" * 50) + " > /tmp/b.txt")
+    assert second.exit_code == 0
+    assert vfs._dynamic_bytes_used == 100
+    third = await shell.execute("echo -n " + ("C" * 50) + " > /tmp/c.txt")
+    assert third.exit_code == 1
+    assert third.output == "bash: echo: write error: No space left on device\n"
+    assert not vfs.exists("/tmp/c.txt", "/")
+
+
+async def test_removing_file_frees_dynamic_quota_for_later_writes(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    vfs.max_file_size_bytes = 80
+    vfs.max_total_vfs_bytes = 50
+    written = await shell.execute("echo -n " + ("A" * 50) + " > /tmp/keep.txt")
+    assert written.exit_code == 0
+    assert vfs._dynamic_bytes_used == 50
+    blocked = await shell.execute("echo -n " + ("B" * 50) + " > /tmp/more.txt")
+    assert blocked.exit_code == 1
+    assert "No space left on device" in blocked.output
+    removed = await shell.execute("rm /tmp/keep.txt")
+    assert removed.exit_code == 0
+    assert vfs._dynamic_bytes_used == 0
+    again = await shell.execute("echo -n " + ("B" * 50) + " > /tmp/more.txt")
+    assert again.exit_code == 0
+    assert vfs._dynamic_bytes_used == 50
+
+
+async def test_urandom_redirect_stops_at_quota_without_python_error(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    vfs.max_file_size_bytes = 4096
+    vfs.max_read_chunk_bytes = 1024
+    result = await shell.execute("cat /dev/urandom > /tmp/big")
+    assert result.exit_code == 1
+    assert result.output == "bash: cat: write error: File too large\n"
+    node = vfs.get("/tmp/big", "/")
+    assert isinstance(node, VFSFile)
+    assert 0 < node.size <= 4096
+    assert vfs._dynamic_bytes_used <= 4096
+    zero = await shell.execute("cat /dev/zero > /tmp/zeros")
+    assert zero.exit_code == 1
+    assert "File too large" in zero.output or "No space left on device" in zero.output
+
+
+async def test_ls_l_single_file_displays_path_argument(shell: Shell) -> None:
+    result = await shell.execute("ls -l /dev/null")
+    assert result.exit_code == 0
+    assert result.output.endswith(" /dev/null")
+    assert "/dev/null" in result.output
+    listing = await shell.execute("ls -l /dev")
+    assert listing.output.startswith("total ")
+    names = [line.rsplit(" ", 1)[-1] for line in listing.output.splitlines()[1:]]
+    assert "null" in names
+    assert "/dev/null" not in names
+
+
+async def test_noninteractive_ssh_exec_guarantees_trailing_newline() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeSshProcess("echo -n hello")
+    await handle_client(process, NullLLMProvider(), manager)
+    assert process.stdout.text == "hello\n"
+    assert process.stdout.text.endswith("\n")
+    assert process.exit_code == 0
+
+
+class _FakeSshStdout:
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+
+    def write(self, data: str) -> None:
+        self.chunks.append(data)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
+
+
+class _FakeSshProcess:
+    def __init__(self, command: str | None) -> None:
+        self.command = command
+        self.stdout = _FakeSshStdout()
+        self.stdin = MagicMock()
+        self.stdin.readline = AsyncMock(return_value="")
+        self.channel = MagicMock()
+        self.channel.get_connection.side_effect = AttributeError
+        self.exit_code: int | None = None
+        self.closed = False
+
+    def exit(self, code: int) -> None:
+        self.exit_code = code
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+    def get_extra_info(self, _name: str, default: object = None) -> object:
+        return default
