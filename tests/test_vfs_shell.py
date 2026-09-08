@@ -220,7 +220,8 @@ async def test_cat_file_directory_and_missing(shell: Shell) -> None:
     assert "No such file or directory" in mixed.output
 
     no_operand = await shell.execute("cat")
-    assert "missing file operand" in no_operand.output
+    assert no_operand.output == ""
+    assert no_operand.exit_code == 0
 
 
 async def test_empty_and_whitespace_input_is_noop(shell: Shell) -> None:
@@ -812,3 +813,110 @@ async def test_file_mutations_do_not_touch_host_filesystem(
     assert "file" in listing.output.split("  ")
     assert not (tmp_path / marker).exists()
     assert not host_tmp.exists()
+
+
+async def test_semicolon_runs_both_and_last_status(shell: Shell) -> None:
+    result = await shell.execute("echo a; echo b")
+    assert result.output == "a\nb\n"
+    assert result.exit_code == 0
+    status = await shell.execute("echo $?")
+    assert status.output == "0\n"
+
+
+async def test_and_chain_mkdir_then_touch(shell: Shell) -> None:
+    result = await shell.execute("mkdir /tmp/d && touch /tmp/d/f")
+    assert result.output == ""
+    assert result.exit_code == 0
+    listing = await shell.execute("ls /tmp/d")
+    assert "f" in listing.output.split("  ")
+
+
+async def test_and_chain_short_circuits_on_rm_failure(shell: Shell) -> None:
+    result = await shell.execute("rm /nonexistent && touch /tmp/fail")
+    assert "No such file or directory" in result.output
+    assert result.exit_code != 0
+    listing = await shell.execute("ls /tmp")
+    assert "fail" not in listing.output.split("  ")
+
+
+async def test_or_chain_runs_fallback_touch(shell: Shell) -> None:
+    result = await shell.execute("rm /nonexistent || touch /tmp/fallback")
+    assert "No such file or directory" in result.output
+    assert result.exit_code == 0
+    listing = await shell.execute("ls /tmp")
+    assert "fallback" in listing.output.split("  ")
+
+
+async def test_mixed_conditionals_and_semicolon(shell: Shell) -> None:
+    result = await shell.execute("false && echo no || echo yes; echo always")
+    assert result.output == "yes\nalways\n"
+    assert "no" not in result.output
+    assert result.exit_code == 0
+    status = await shell.execute("echo $?")
+    assert status.output == "0\n"
+
+
+async def test_echo_n_redirect_has_no_extra_newline(shell: Shell) -> None:
+    written = await shell.execute('echo -n "hello" > /tmp/test.txt')
+    assert written.output == ""
+    assert written.exit_code == 0
+    contents = await shell.execute("cat /tmp/test.txt")
+    assert contents.output == "hello"
+
+
+async def test_append_redirect_after_echo_n(shell: Shell) -> None:
+    await shell.execute('echo -n "hello" > /tmp/test.txt')
+    appended = await shell.execute('echo "world" >> /tmp/test.txt')
+    assert appended.output == ""
+    assert appended.exit_code == 0
+    contents = await shell.execute("cat /tmp/test.txt")
+    assert contents.output == "helloworld\n"
+
+
+async def test_empty_redirect_creates_zero_byte_file(shell: Shell) -> None:
+    result = await shell.execute("> /tmp/empty.txt")
+    assert result.output == ""
+    assert result.exit_code == 0
+    contents = await shell.execute("cat /tmp/empty.txt")
+    assert contents.output == ""
+    listing = await shell.execute("ls /tmp")
+    assert "empty.txt" in listing.output.split("  ")
+
+
+async def test_redirect_missing_parent_directory(shell: Shell) -> None:
+    result = await shell.execute("echo hi > /no/such/file.txt")
+    assert result.exit_code == 1
+    assert result.output == "bash: /no/such/file.txt: No such file or directory"
+
+
+async def test_pipeline_echo_grep_matching_line(shell: Shell) -> None:
+    result = await shell.execute('echo "line1\nline2" | grep line1')
+    assert result.output == "line1\n"
+    assert "line2" not in result.output
+    assert result.exit_code == 0
+
+
+async def test_pipeline_cat_issue_grep_ignore_case(shell: Shell) -> None:
+    result = await shell.execute("cat /etc/issue | grep -i ubuntu")
+    assert result.exit_code == 0
+    assert "Ubuntu" in result.output
+
+
+async def test_quoted_operators_are_literal_text(shell: Shell) -> None:
+    result = await shell.execute('echo "hello && world; foo | bar > baz"')
+    assert result.output == "hello && world; foo | bar > baz\n"
+    assert result.exit_code == 0
+    listing = await shell.execute("ls /tmp")
+    assert "baz" not in listing.output.split("  ")
+
+
+async def test_pipeline_unknown_command_receives_stdin(vfs: VirtualFileSystem) -> None:
+    provider = RecordingLLMProvider()
+    shell = Shell(vfs, llm_provider=provider)
+    await shell.execute("echo hello | nosuch")
+    assert len(provider.calls) == 1
+    command, _cwd, context = provider.calls[0]
+    assert command.startswith("nosuch")
+    assert "hello" in command
+    assert context is not None
+    assert context["stdin"] == "hello\n"

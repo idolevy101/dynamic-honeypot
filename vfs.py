@@ -43,6 +43,8 @@ PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-poli
 UBUNTU_CODENAME=jammy
 """
 
+ISSUE: Final[str] = "Ubuntu 22.04.3 LTS \\n \\l\n"
+
 PROC_VERSION: Final[str] = (
     f"Linux version {KERNEL_RELEASE} (buildd@lcy02-amd64-044) "
     "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) "
@@ -292,6 +294,7 @@ def build_honeypot_tree() -> VFSDirectory:
     etc = _directory(
         "etc",
         _file("os-release", OS_RELEASE),
+        _file("issue", ISSUE),
         _file("passwd", PASSWD),
         _file("hostname", f"{HOSTNAME}\n"),
         _file("resolv.conf", RESOLV_CONF),

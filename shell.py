@@ -7,6 +7,7 @@ Host OS execution is never used.
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import time
 from dataclasses import dataclass
@@ -409,12 +410,13 @@ class _ChainSegment:
     operator: str
 
 
-def split_command_chain(line: str) -> list[_ChainSegment]:
-    """Split ``;``, ``&&``, and ``||`` outside quotes. Pipes are left intact."""
-    segments: list[_ChainSegment] = []
+def _split_operators(line: str, operators: Sequence[str]) -> list[tuple[str, str]]:
+    """Split ``line`` on ``operators`` outside quotes. Longest match wins."""
+    seps = tuple(sorted(operators, key=len, reverse=True))
+    fragments: list[tuple[str, str]] = []
     buf: list[str] = []
-    quote: str | None = None
     incoming = ""
+    quote: str | None = None
     index = 0
     length = len(line)
     while index < length:
@@ -438,36 +440,89 @@ def split_command_chain(line: str) -> list[_ChainSegment]:
             buf.append(char)
             index += 1
             continue
-        if char == ";":
+        matched: str | None = None
+        for sep in seps:
+            if line.startswith(sep, index):
+                matched = sep
+                break
+        if matched is not None:
             command = "".join(buf).strip()
             if command:
-                segments.append(_ChainSegment(command, incoming))
-                incoming = ";"
+                fragments.append((incoming, command))
+            incoming = matched
             buf = []
-            index += 1
-            continue
-        if char == "&" and index + 1 < length and line[index + 1] == "&":
-            command = "".join(buf).strip()
-            if command:
-                segments.append(_ChainSegment(command, incoming))
-                incoming = "&&"
-            buf = []
-            index += 2
-            continue
-        if char == "|" and index + 1 < length and line[index + 1] == "|":
-            command = "".join(buf).strip()
-            if command:
-                segments.append(_ChainSegment(command, incoming))
-                incoming = "||"
-            buf = []
-            index += 2
+            index += len(matched)
             continue
         buf.append(char)
         index += 1
     command = "".join(buf).strip()
     if command:
-        segments.append(_ChainSegment(command, incoming))
-    return segments
+        fragments.append((incoming, command))
+    return fragments
+
+
+def split_statements(line: str) -> list[str]:
+    """Split top-level ``;`` outside quotes (lowest precedence)."""
+    return [command for _operator, command in _split_operators(line, (";",))]
+
+
+def split_conditionals(line: str) -> list[_ChainSegment]:
+    """Split ``&&`` and ``||`` outside quotes, preserving incoming operators."""
+    return [
+        _ChainSegment(command, operator)
+        for operator, command in _split_operators(line, ("&&", "||"))
+    ]
+
+
+def split_pipeline(line: str) -> list[str]:
+    """Split ``|`` outside quotes, leaving ``||`` intact."""
+    stages: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(line)
+    while index < length:
+        char = line[index]
+        if quote is None and char == "\\":
+            buf.append(char)
+            if index + 1 < length:
+                buf.append(line[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            buf.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            buf.append(char)
+            index += 1
+            continue
+        if char == "|" and not (index + 1 < length and line[index + 1] == "|"):
+            stage = "".join(buf).strip()
+            if stage:
+                stages.append(stage)
+            buf = []
+            index += 1
+            continue
+        buf.append(char)
+        index += 1
+    stage = "".join(buf).strip()
+    if stage:
+        stages.append(stage)
+    return stages
+
+
+def split_command_chain(line: str) -> list[_ChainSegment]:
+    """Split ``;``, ``&&``, and ``||`` outside quotes. Pipes are left intact."""
+    return [
+        _ChainSegment(command, operator)
+        for operator, command in _split_operators(line, (";", "&&", "||"))
+    ]
 
 
 @dataclass(frozen=True)
@@ -723,8 +778,11 @@ class Shell:
             "cd": self._cmd_cd,
             "ls": self._cmd_ls,
             "cat": self._cmd_cat,
+            "grep": self._cmd_grep,
             "touch": self._cmd_touch,
             "echo": self._cmd_echo,
+            "true": self._cmd_true,
+            "false": self._cmd_false,
             "mkdir": self._cmd_mkdir,
             "rm": self._cmd_rm,
             "rmdir": self._cmd_rmdir,
@@ -751,13 +809,25 @@ class Shell:
         stripped = line.strip()
         if not stripped:
             return CommandResult()
-        segments = split_command_chain(stripped)
-        if len(segments) <= 1:
-            command = segments[0].command if segments else stripped
-            return await self._execute_simple(command)
-        return await self._execute_chain(segments)
+        outputs: list[str] = []
+        last = CommandResult()
+        for statement in split_statements(stripped):
+            last = await self._execute_conditionals(statement)
+            if last.output:
+                outputs.append(last.output)
+            if last.exit_session:
+                break
+        return CommandResult(
+            output="".join(outputs),
+            exit_session=last.exit_session,
+            exit_code=last.exit_code,
+            execution_path=last.execution_path,
+        )
 
-    async def _execute_chain(self, segments: list[_ChainSegment]) -> CommandResult:
+    async def _execute_conditionals(self, statement: str) -> CommandResult:
+        segments = split_conditionals(statement)
+        if not segments:
+            return CommandResult()
         outputs: list[str] = []
         last = CommandResult()
         last_ok = True
@@ -766,7 +836,7 @@ class Shell:
                 continue
             if segment.operator == "||" and last_ok:
                 continue
-            last = await self._execute_simple(segment.command)
+            last = await self._execute_pipeline(segment.command)
             last_ok = last.ok
             if last.output:
                 outputs.append(last.output)
@@ -779,8 +849,21 @@ class Shell:
             execution_path=last.execution_path,
         )
 
-    async def _execute_simple(self, line: str) -> CommandResult:
-        stripped = line.strip()
+    async def _execute_pipeline(self, line: str) -> CommandResult:
+        stages = split_pipeline(line)
+        if not stages:
+            return CommandResult()
+        stdin = ""
+        last = CommandResult()
+        for stage in stages:
+            last = await self._execute_single_command(stage, stdin)
+            stdin = last.output
+            if last.exit_session:
+                break
+        return last
+
+    async def _execute_single_command(self, cmd_line: str, stdin: str = "") -> CommandResult:
+        stripped = cmd_line.strip()
         if not stripped:
             return CommandResult()
         started = time.perf_counter()
@@ -789,7 +872,7 @@ class Shell:
         result = CommandResult()
         try:
             try:
-                tokens = shlex.split(line, posix=True)
+                tokens = shlex.split(cmd_line, posix=True)
             except ValueError as exc:
                 result = _fail(f"bash: {exc}", exit_code=2)
             else:
@@ -801,19 +884,19 @@ class Shell:
                     except ValueError as exc:
                         result = _fail(str(exc), exit_code=2)
                     else:
-                        if not command_tokens:
-                            result = CommandResult()
-                        else:
+                        if command_tokens:
                             dispatch_line = (
-                                stripped if redirect_path is None else " ".join(command_tokens)
+                                stripped
+                                if redirect_path is None
+                                else " ".join(command_tokens)
                             )
                             result, execution_path = await self._dispatch(
-                                command_tokens, dispatch_line
+                                command_tokens, dispatch_line, stdin
                             )
-                            if redirect_path is not None:
-                                result = self._apply_redirection(
-                                    result, redirect_path, append
-                                )
+                        if redirect_path is not None:
+                            result = self._apply_redirection(
+                                result, redirect_path, append
+                            )
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
             await record_command(
@@ -874,7 +957,7 @@ class Shell:
             self._captured_artifacts.append(sha256)
 
     async def _dispatch(
-        self, tokens: list[str], stripped: str
+        self, tokens: list[str], stripped: str, stdin: str = ""
     ) -> tuple[CommandResult, str]:
         command, *args = tokens
         handler = self._handlers.get(command)
@@ -885,6 +968,8 @@ class Shell:
                 path = "static"
             else:
                 path = "vfs"
+            if command in {"cat", "grep"}:
+                return handler(args, stdin), path
             return handler(args), path
         static = lookup_static_output(tokens)
         if static is not None:
@@ -893,17 +978,22 @@ class Shell:
                 "static",
             )
         cacheable = _is_cacheable_llm_command(tokens)
-        if cacheable and stripped in self._llm_cache:
-            output = self._llm_cache[stripped]
+        cache_key = stripped if not stdin else f"{stripped}\0{stdin}"
+        if cacheable and cache_key in self._llm_cache:
+            output = self._llm_cache[cache_key]
             exit_code = 127 if "command not found" in output else 0
             return CommandResult(output, exit_code=exit_code), "cache"
+        context = self._llm_context()
+        if stdin:
+            context["stdin"] = stdin
+        llm_command = stripped if not stdin else f"{stripped}\n{stdin}"
         output = await self._llm_provider.generate_response(
-            stripped,
+            llm_command,
             self._state.cwd,
-            self._llm_context(),
+            context,
         )
         if cacheable:
-            self._llm_cache[stripped] = output
+            self._llm_cache[cache_key] = output
         exit_code = 127 if "command not found" in output else 0
         return CommandResult(output, exit_code=exit_code), "llm"
 
@@ -973,11 +1063,9 @@ class Shell:
             return CommandResult(self._format_ls_dir(node, abs_path, long_fmt, show_all))
         return CommandResult(self._format_ls_file(node, display, long_fmt))
 
-    def _cmd_cat(self, args: list[str]) -> CommandResult:
+    def _cmd_cat(self, args: list[str], stdin: str = "") -> CommandResult:
         if not args:
-            return _fail(
-                "cat: missing file operand\nTry 'cat --help' for more information."
-            )
+            return CommandResult(stdin)
         chunks: list[str] = []
         failed = False
         for path in args:
@@ -994,11 +1082,78 @@ class Shell:
                 chunks.append(f"cat: {path}: Not a directory\n")
         return CommandResult("".join(chunks), exit_code=1 if failed else 0)
 
+    def _cmd_grep(self, args: list[str], stdin: str = "") -> CommandResult:
+        ignore_case = False
+        pattern: str | None = None
+        files: list[str] = []
+        for arg in args:
+            if arg in ("-i", "--ignore-case"):
+                ignore_case = True
+                continue
+            if arg.startswith("--"):
+                continue
+            if arg.startswith("-") and arg != "-":
+                if "i" in arg[1:]:
+                    ignore_case = True
+                continue
+            if pattern is None:
+                pattern = arg
+                continue
+            files.append(arg)
+        if pattern is None:
+            return _fail(
+                "grep: missing pattern\nTry 'grep --help' for more information."
+            )
+        errors: list[str] = []
+        if files:
+            texts: list[str] = []
+            for path in files:
+                try:
+                    texts.append(self._vfs.read_file(path, self._state.cwd))
+                except FileNotFoundError:
+                    errors.append(f"grep: {path}: No such file or directory\n")
+                except IsADirectoryError:
+                    errors.append(f"grep: {path}: Is a directory\n")
+                except NotADirectoryError:
+                    errors.append(f"grep: {path}: Not a directory\n")
+            corpus = "".join(texts)
+        else:
+            corpus = stdin
+        flags = re.IGNORECASE if ignore_case else 0
+        try:
+            regex = re.compile(pattern, flags)
+        except re.error:
+            return _fail(f"grep: invalid regular expression: {pattern}")
+        matches = [line for line in corpus.splitlines() if regex.search(line)]
+        matched_text = ("\n".join(matches) + "\n") if matches else ""
+        output = "".join(errors) + matched_text
+        if errors:
+            exit_code = 2
+        elif matches:
+            exit_code = 0
+        else:
+            exit_code = 1
+        return CommandResult(output, exit_code=exit_code)
+
     def _cmd_echo(self, args: list[str]) -> CommandResult:
+        newline = True
+        index = 0
+        while index < len(args) and args[index] == "-n":
+            newline = False
+            index += 1
         expanded = [
-            arg.replace("$?", str(self._state.last_exit_code)) for arg in args
+            arg.replace("$?", str(self._state.last_exit_code)) for arg in args[index:]
         ]
-        return CommandResult(" ".join(expanded) + "\n")
+        text = " ".join(expanded)
+        if newline:
+            text += "\n"
+        return CommandResult(text)
+
+    def _cmd_true(self, _args: list[str]) -> CommandResult:
+        return CommandResult()
+
+    def _cmd_false(self, _args: list[str]) -> CommandResult:
+        return CommandResult(exit_code=1)
 
     def _cmd_mkdir(self, args: list[str]) -> CommandResult:
         parents = False
