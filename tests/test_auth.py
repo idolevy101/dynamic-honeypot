@@ -4,10 +4,13 @@ import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from auth import AuthAttemptLimitExceeded, AuthManager, DEFAULT_WEAK_PASSWORDS
+from server import HoneypotServer
+from session_manager import SessionManager
 
 
 @pytest.fixture
@@ -62,6 +65,45 @@ def test_max_attempts_raises_on_third_failure() -> None:
     asyncio.run(scenario())
 
 
+async def test_first_failed_attempt_does_not_lock_or_raise() -> None:
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    client_ip = "198.51.100.40"
+    session_id = auth.create_session(client_ip)
+
+    result = await auth.validate_login(client_ip, session_id, "root", "wrong")
+    assert result is False
+    assert not auth.is_locked_out(client_ip)
+
+    pinned = auth.get_or_pin_password(client_ip)
+    assert await auth.validate_login(client_ip, session_id, "root", pinned) is True
+    assert not auth.is_locked_out(client_ip)
+
+
+async def test_first_failed_ssh_password_does_not_disconnect() -> None:
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    sessions = SessionManager()
+    server = HoneypotServer(auth, sessions)
+    conn = MagicMock()
+    conn.get_extra_info.return_value = ("198.51.100.41", 54321)
+    server.connection_made(conn)
+
+    result = await server.validate_password("root", "wrong")
+    assert result is False
+    conn.disconnect.assert_not_called()
+    assert not auth.is_locked_out("198.51.100.41")
+
+    result = await server.validate_password("root", "wrong")
+    assert result is False
+    conn.disconnect.assert_not_called()
+    assert not auth.is_locked_out("198.51.100.41")
+
+    result = await server.validate_password("root", "wrong")
+    assert result is False
+    await asyncio.sleep(0)
+    conn.disconnect.assert_called_once()
+    assert auth.is_locked_out("198.51.100.41")
+
+
 def test_successful_login_does_not_consume_attempts() -> None:
     async def scenario() -> None:
         auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
@@ -77,9 +119,15 @@ def test_successful_login_does_not_consume_attempts() -> None:
     asyncio.run(scenario())
 
 
-def test_reconnect_resets_attempts_but_keeps_pin() -> None:
+def test_reconnect_keeps_lockout_until_ttl() -> None:
     async def scenario() -> None:
-        auth = AuthManager(passwords=("hunter2",), tarpit_seconds=0.0)
+        now = 1_000.0
+        auth = AuthManager(
+            passwords=("hunter2",),
+            tarpit_seconds=0.0,
+            attempt_ttl_seconds=300,
+            clock=lambda: now,
+        )
         client_ip = "192.0.2.55"
         first = auth.create_session(client_ip)
         pinned = auth.get_or_pin_password(client_ip)
@@ -91,17 +139,24 @@ def test_reconnect_resets_attempts_but_keeps_pin() -> None:
 
         auth.release_session(first)
         assert auth.get_or_pin_password(client_ip) == pinned
+        assert auth.is_locked_out(client_ip)
 
         second = auth.create_session(client_ip)
         assert second != first
-        assert await auth.validate_login(client_ip, second, "root", "wrong") is False
-        assert await auth.validate_login(client_ip, second, "root", "wrong") is False
-        assert await auth.validate_login(client_ip, second, "root", pinned) is True
+        with pytest.raises(AuthAttemptLimitExceeded):
+            await auth.validate_login(client_ip, second, "root", pinned)
+
+        now = 1_301.0
+        assert auth.sweep() == 0
+        assert not auth.is_locked_out(client_ip)
+        third = auth.create_session(client_ip)
+        assert await auth.validate_login(client_ip, third, "root", "wrong") is False
+        assert await auth.validate_login(client_ip, third, "root", pinned) is True
 
     asyncio.run(scenario())
 
 
-def test_concurrent_sessions_share_pin_but_not_attempt_counters() -> None:
+def test_concurrent_sessions_share_ip_lockout() -> None:
     async def scenario() -> None:
         auth = AuthManager(passwords=("shared",), tarpit_seconds=0.0)
         client_ip = "192.0.2.200"
@@ -114,8 +169,8 @@ def test_concurrent_sessions_share_pin_but_not_attempt_counters() -> None:
         with pytest.raises(AuthAttemptLimitExceeded):
             await auth.validate_login(client_ip, session_a, "root", "bad")
 
-        assert await auth.validate_login(client_ip, session_b, "root", "bad") is False
-        assert await auth.validate_login(client_ip, session_b, "root", pinned) is True
+        with pytest.raises(AuthAttemptLimitExceeded):
+            await auth.validate_login(client_ip, session_b, "root", pinned)
 
     asyncio.run(scenario())
 
@@ -167,6 +222,31 @@ def test_auth_sweep_clears_expired_pins() -> None:
     now = 56.0
     assert auth.sweep() == 1
     assert "192.0.2.10" not in auth
+
+
+def test_auth_sweep_clears_expired_lockouts() -> None:
+    async def scenario() -> None:
+        now = 50.0
+        auth = AuthManager(
+            passwords=("secret",),
+            tarpit_seconds=0.0,
+            ttl_seconds=3600,
+            attempt_ttl_seconds=5,
+            clock=lambda: now,
+        )
+        client_ip = "192.0.2.77"
+        session_id = auth.create_session(client_ip)
+        with pytest.raises(AuthAttemptLimitExceeded):
+            await auth.validate_login(client_ip, session_id, "root", "a")
+            await auth.validate_login(client_ip, session_id, "root", "b")
+            await auth.validate_login(client_ip, session_id, "root", "c")
+        assert auth.is_locked_out(client_ip)
+        now = 56.0
+        assert auth.sweep() == 0
+        assert not auth.is_locked_out(client_ip)
+        assert "192.0.2.77" in auth
+
+    asyncio.run(scenario())
 
 
 async def test_auth_attempt_telemetry_success_and_failure() -> None:

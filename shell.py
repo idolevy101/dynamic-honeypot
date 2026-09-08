@@ -23,7 +23,6 @@ from vfs import (
     INode,
     KERNEL_RELEASE,
     KERNEL_VERSION,
-    UNAME_A,
     VFSDirectory,
     VirtualFileSystem,
     canonicalize,
@@ -329,6 +328,7 @@ _UNAME_FIELDS: Final[dict[str, str]] = {
     "i": "x86_64",
     "o": "GNU/Linux",
 }
+_UNAME_ALL_FLAGS: Final[tuple[str, ...]] = ("s", "n", "r", "v", "m", "p", "i", "o")
 
 _STATIC_OUTPUTS: Final[dict[tuple[str, ...], str]] = {
     ("ps", "aux"): _PS_AUX.rstrip("\n"),
@@ -631,6 +631,29 @@ def _lookup_static_aliases(tokens: Sequence[str]) -> str | None:
     return None
 
 
+def format_uname(args: Sequence[str]) -> str:
+    """Assemble uname stdout from identity fields, always space-separated."""
+    if not args:
+        return _UNAME_FIELDS["s"]
+    flags: list[str] = []
+    for arg in args:
+        if arg in ("-a", "--all"):
+            return " ".join(_UNAME_FIELDS[flag] for flag in _UNAME_ALL_FLAGS)
+        if arg.startswith("--"):
+            continue
+        if arg.startswith("-") and arg != "-":
+            letters = arg[1:]
+            if "a" in letters:
+                return " ".join(_UNAME_FIELDS[flag] for flag in _UNAME_ALL_FLAGS)
+            flags.extend(letters)
+    if not flags:
+        return _UNAME_FIELDS["s"]
+    parts = [_UNAME_FIELDS[flag] for flag in flags if flag in _UNAME_FIELDS]
+    if not parts:
+        return _UNAME_FIELDS["s"]
+    return " ".join(parts)
+
+
 def lookup_static_output(tokens: Sequence[str]) -> str | None:
     """Return a pre-LLM recon template, or None to fall through to the provider."""
     if not tokens:
@@ -656,6 +679,7 @@ class SessionState:
     cwd: str = DEFAULT_HOME
     oldpwd: str | None = None
     home: str = DEFAULT_HOME
+    last_exit_code: int = 0
 
 
 @dataclass(frozen=True)
@@ -799,12 +823,14 @@ class Shell:
                 duration_ms=duration_ms,
                 captured_artifacts=self._captured_artifacts,
             )
-        return CommandResult(
+        stamped = CommandResult(
             output=result.output,
             exit_session=result.exit_session,
             exit_code=result.exit_code,
             execution_path=execution_path,
         )
+        self._state.last_exit_code = stamped.exit_code
+        return stamped
 
     def _apply_redirection(
         self,
@@ -968,7 +994,10 @@ class Shell:
         return CommandResult("".join(chunks), exit_code=1 if failed else 0)
 
     def _cmd_echo(self, args: list[str]) -> CommandResult:
-        return CommandResult(" ".join(args) + "\n")
+        expanded = [
+            arg.replace("$?", str(self._state.last_exit_code)) for arg in args
+        ]
+        return CommandResult(" ".join(expanded) + "\n")
 
     def _cmd_mkdir(self, args: list[str]) -> CommandResult:
         parents = False
@@ -1142,24 +1171,7 @@ class Shell:
         return CommandResult("\n".join(lines), exit_code=1 if missing else 0)
 
     def _cmd_uname(self, args: list[str]) -> CommandResult:
-        if not args:
-            return CommandResult(_UNAME_FIELDS["s"])
-        flags: list[str] = []
-        for arg in args:
-            if arg in ("-a", "--all"):
-                return CommandResult(UNAME_A)
-            if arg.startswith("--"):
-                continue
-            if arg.startswith("-") and arg != "-":
-                flags.extend(arg[1:])
-        if not flags:
-            return CommandResult(_UNAME_FIELDS["s"])
-        if "a" in flags:
-            return CommandResult(UNAME_A)
-        parts = [_UNAME_FIELDS[flag] for flag in flags if flag in _UNAME_FIELDS]
-        if not parts:
-            return CommandResult(_UNAME_FIELDS["s"])
-        return CommandResult(" ".join(parts))
+        return CommandResult(format_uname(args))
 
     def _cmd_env(self, _args: list[str]) -> CommandResult:
         lines = [

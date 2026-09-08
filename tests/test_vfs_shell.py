@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from llm import NullLLMProvider
-from shell import CommandResult, SessionState, Shell, lookup_static_output
+from shell import CommandResult, SessionState, Shell, format_uname, lookup_static_output
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
@@ -494,6 +494,23 @@ async def test_which_unknown_tool_is_empty_static_failure(shell: Shell) -> None:
     assert result.execution_path == "static"
 
 
+async def test_uname_a_execute_path_exact_string(shell: Shell) -> None:
+    expected = (
+        "Linux ubuntu-srv 5.15.0-88-generic "
+        "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023 "
+        "x86_64 x86_64 x86_64 GNU/Linux"
+    )
+    result = await shell.execute("uname -a")
+    assert result.execution_path == "static"
+    assert result.output == expected
+    assert "2023 x86_64" in result.output
+    assert "2023x86_64" not in result.output
+    assert format_uname(["-a"]) == expected
+    assert format_uname(["-snrvmpio"]) == expected
+    combined = await shell.execute("uname -snrvmpio")
+    assert combined.output == expected
+
+
 async def test_kernel_identity_is_consistent_across_proc_and_uname(
     shell: Shell,
 ) -> None:
@@ -505,11 +522,23 @@ async def test_kernel_identity_is_consistent_across_proc_and_uname(
     assert uname_r.execution_path == "static"
     assert version.output == PROC_VERSION
     assert uname_r.output == KERNEL_RELEASE
+    assert uname_a.output == (
+        "Linux ubuntu-srv 5.15.0-88-generic "
+        "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023 "
+        "x86_64 x86_64 x86_64 GNU/Linux"
+    )
     assert KERNEL_RELEASE in version.output
     assert KERNEL_RELEASE in uname_a.output
-    assert "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023" in version.output
-    assert "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023" in uname_a.output
-    assert uname_a.output == UNAME_A
+
+
+async def test_echo_status_after_which_unknown(shell: Shell) -> None:
+    missing = await shell.execute("which invalid_bin")
+    assert missing.output == ""
+    assert missing.exit_code == 1
+    assert missing.execution_path == "static"
+    status = await shell.execute("echo $?")
+    assert status.output == "1\n"
+    assert status.exit_code == 0
 
 
 async def test_proactive_recon_commands_are_static(vfs: VirtualFileSystem) -> None:

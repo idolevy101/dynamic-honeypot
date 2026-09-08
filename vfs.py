@@ -13,8 +13,17 @@ HOSTNAME: Final[str] = "ubuntu-srv"
 DEFAULT_HOME: Final[str] = "/root"
 KERNEL_RELEASE: Final[str] = "5.15.0-88-generic"
 KERNEL_VERSION: Final[str] = "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023"
-UNAME_A: Final[str] = (
-    f"Linux {HOSTNAME} {KERNEL_RELEASE} {KERNEL_VERSION} x86_64 x86_64 x86_64 GNU/Linux"
+UNAME_A: Final[str] = " ".join(
+    (
+        "Linux",
+        HOSTNAME,
+        KERNEL_RELEASE,
+        KERNEL_VERSION,
+        "x86_64",
+        "x86_64",
+        "x86_64",
+        "GNU/Linux",
+    )
 )
 _DEFAULT_MTIME: Final[datetime] = datetime(2024, 4, 10, 9, 15, tzinfo=timezone.utc)
 

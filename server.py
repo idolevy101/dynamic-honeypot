@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -11,6 +12,8 @@ from auth import AuthAttemptLimitExceeded, AuthManager
 from llm import LLMProvider, create_llm_provider
 from session_manager import SessionManager
 from shell import Shell
+
+_LOGGER = logging.getLogger(__name__)
 
 HOST = "127.0.0.1"
 PORT = 2222
@@ -96,19 +99,28 @@ class HoneypotServer(asyncssh.SSHServer):
         if self._session_id is None or self._client_ip is None:
             return False
         try:
-            return await self._auth.validate_login(
+            accepted = await self._auth.validate_login(
                 self._client_ip,
                 self._session_id,
                 username,
                 password,
             )
         except AuthAttemptLimitExceeded:
-            self._disconnect_auth_limit()
-            return False
+            accepted = False
         except asyncio.CancelledError:
             raise
-        except _DISCONNECT_ERRORS:
+        except Exception:
+            _LOGGER.exception("password authentication callback failed")
             return False
+        if (
+            not accepted
+            and self._client_ip is not None
+            and self._auth.is_locked_out(self._client_ip)
+        ):
+            # Disconnect after this callback returns so AsyncSSH can send
+            # USERAUTH_FAILURE instead of aborting the TCP session mid-auth.
+            asyncio.get_running_loop().call_soon(self._disconnect_auth_limit)
+        return accepted
 
     def _disconnect_auth_limit(self) -> None:
         conn = self._conn
