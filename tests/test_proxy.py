@@ -61,6 +61,8 @@ async def _start_proxy(
     listen_port: int,
     backend_port: int,
     extra_args: list[str] | None = None,
+    *,
+    send_proxy_protocol: bool = False,
 ) -> asyncio.subprocess.Process:
     cmd = [
         str(proxy_bin),
@@ -70,6 +72,7 @@ async def _start_proxy(
         str(backend_port),
         "-h",
         "127.0.0.1",
+        "--send-proxy-protocol" if send_proxy_protocol else "--no-send-proxy-protocol",
     ]
     if extra_args:
         cmd.extend(extra_args)
@@ -126,6 +129,8 @@ async def test_proxy_help(proxy_bin: Path) -> None:
     assert b"--max-per-ip" in stdout
     assert b"--rate-limit" in stdout
     assert b"--rate-burst" in stdout
+    assert b"--send-proxy-protocol" in stdout
+    assert b"--no-send-proxy-protocol" in stdout
     assert stderr == b""
 
 
@@ -375,3 +380,227 @@ async def test_proxy_counters_decrement_on_close(proxy_bin: Path) -> None:
         finally:
             await _close_clients(held)
 
+
+def test_parse_proxy_v1_line() -> None:
+    from server import parse_proxy_v1_line
+
+    assert parse_proxy_v1_line(b"PROXY TCP4 198.51.100.10 127.0.0.1 54321 2222") == (
+        "198.51.100.10",
+        54321,
+    )
+    assert parse_proxy_v1_line(b"PROXY TCP6 ::1 ::1 1234 2222") == ("::1", 1234)
+    assert parse_proxy_v1_line(b"PROXY UNKNOWN") is None
+    assert parse_proxy_v1_line(b"SSH-2.0-OpenSSH") is None
+
+
+async def test_read_optional_proxy_fallback_without_header() -> None:
+    from server import read_optional_proxy
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(SSH_BANNER)
+    reader.feed_eof()
+    info = await read_optional_proxy(reader, "203.0.113.9")
+    assert info.proxied is False
+    assert info.client_ip == "203.0.113.9"
+    assert info.leftover.startswith(b"SSH-2.0")
+    assert info.client_port is None
+
+
+async def test_read_optional_proxy_strips_header_and_keeps_ssh_bytes() -> None:
+    from server import read_optional_proxy
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(
+        b"PROXY TCP4 198.51.100.10 127.0.0.1 54321 2222\r\n" + SSH_BANNER
+    )
+    reader.feed_eof()
+    info = await read_optional_proxy(reader, "127.0.0.1")
+    assert info.proxied is True
+    assert info.client_ip == "198.51.100.10"
+    assert info.client_port == 54321
+    assert info.leftover == SSH_BANNER
+
+
+async def test_honeypot_server_uses_proxy_protocol_client_ip() -> None:
+    from unittest.mock import MagicMock
+
+    from auth import AuthManager
+    from server import HoneypotServer, _PROXY_CLIENT_IP
+    from session_manager import SessionManager
+
+    server = HoneypotServer(AuthManager(tarpit_seconds=0.0), SessionManager())
+    conn = MagicMock()
+    conn.get_extra_info.return_value = ("127.0.0.1", 40000)
+    token = _PROXY_CLIENT_IP.set("198.51.100.7")
+    try:
+        server.connection_made(conn)
+    finally:
+        _PROXY_CLIENT_IP.reset(token)
+    conn.set_extra_info.assert_called()
+    kwargs = conn.set_extra_info.call_args.kwargs
+    assert kwargs["honeypot_client_ip"] == "198.51.100.7"
+
+
+async def test_proxy_protocol_forwards_real_client_ip(proxy_bin: Path) -> None:
+    from server import read_optional_proxy
+
+    captured: list[tuple[str, bytes, bool, int | None, object]] = []
+
+    async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        fallback = str(peer[0]) if isinstance(peer, tuple) and peer else "unknown"
+        try:
+            info = await read_optional_proxy(reader, fallback)
+            rest = await asyncio.wait_for(reader.read(4096), timeout=1.0)
+            captured.append(
+                (info.client_ip, info.leftover + rest, info.proxied, info.client_port, peer)
+            )
+        except TimeoutError:
+            captured.append((fallback, b"", False, None, peer))
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    server = await asyncio.start_server(handler, "127.0.0.1", 0)
+    backend_port = int(server.sockets[0].getsockname()[1])
+    listen_port = _free_port()
+    proc = await _start_proxy(
+        proxy_bin,
+        listen_port,
+        backend_port,
+        send_proxy_protocol=True,
+    )
+    sockname: object = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", listen_port),
+            timeout=5.0,
+        )
+        sockname = writer.get_extra_info("sockname")
+        writer.write(SSH_BANNER)
+        await writer.drain()
+        await asyncio.sleep(0.25)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+    finally:
+        rc = await _stop_proxy(proc)
+        server.close()
+        await server.wait_closed()
+    assert rc == 0
+    assert captured
+    client_ip, payload, proxied, client_port, peer = captured[0]
+    assert proxied is True
+    assert client_ip == "127.0.0.1"
+    assert isinstance(sockname, tuple)
+    assert client_port == int(sockname[1])
+    assert isinstance(peer, tuple)
+    assert client_port != int(peer[1])
+    assert not payload.startswith(b"PROXY ")
+    assert payload.startswith(SSH_BANNER)
+
+
+async def test_ssh_backend_records_proxy_protocol_ip() -> None:
+    from functools import partial
+
+    import asyncssh
+
+    from auth import AuthManager
+    from llm import NullLLMProvider
+    from server import (
+        HOST_KEY_PATH,
+        ensure_host_key,
+        handle_client,
+        make_server_factory,
+        start_ssh_backend,
+    )
+    from session_manager import SessionManager
+
+    await ensure_host_key(HOST_KEY_PATH)
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    sessions = SessionManager()
+    server = await start_ssh_backend(
+        make_server_factory(auth, sessions),
+        "127.0.0.1",
+        0,
+        server_host_keys=[str(HOST_KEY_PATH)],
+        process_factory=partial(
+            handle_client,
+            llm_provider=NullLLMProvider(),
+            session_manager=sessions,
+        ),
+    )
+    port = int(server.sockets[0].getsockname()[1])
+    sock: socket.socket | None = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        sock.sendall(b"PROXY TCP4 198.51.100.10 127.0.0.1 54321 2222\r\n")
+        async with asyncssh.connect(
+            sock=sock,
+            username="root",
+            password="secret",
+            known_hosts=None,
+        ) as conn:
+            result = await conn.run("echo hi", check=False)
+            assert "unwrapped" in result.stdout or "hi" in result.stdout or result.exit_status == 0
+        assert "198.51.100.10" in sessions
+        assert "127.0.0.1" not in sessions
+        sock = None
+    finally:
+        if sock is not None:
+            sock.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_ssh_backend_falls_back_to_socket_peer() -> None:
+    from functools import partial
+
+    import asyncssh
+
+    from auth import AuthManager
+    from llm import NullLLMProvider
+    from server import (
+        HOST_KEY_PATH,
+        ensure_host_key,
+        handle_client,
+        make_server_factory,
+        start_ssh_backend,
+    )
+    from session_manager import SessionManager
+
+    await ensure_host_key(HOST_KEY_PATH)
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    sessions = SessionManager()
+    server = await start_ssh_backend(
+        make_server_factory(auth, sessions),
+        "127.0.0.1",
+        0,
+        server_host_keys=[str(HOST_KEY_PATH)],
+        process_factory=partial(
+            handle_client,
+            llm_provider=NullLLMProvider(),
+            session_manager=sessions,
+        ),
+    )
+    port = int(server.sockets[0].getsockname()[1])
+    try:
+        async with asyncssh.connect(
+            "127.0.0.1",
+            port,
+            username="root",
+            password="secret",
+            known_hosts=None,
+        ) as conn:
+            result = await conn.run("echo hi", check=False)
+            assert result.exit_status == 0
+        assert "127.0.0.1" in sessions
+        assert "198.51.100.10" not in sessions
+    finally:
+        server.close()
+        await server.wait_closed()

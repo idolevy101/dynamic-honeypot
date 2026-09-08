@@ -127,6 +127,30 @@ void consume_buf(std::vector<std::uint8_t>& buf, std::size_t& head, std::size_t 
     return role == SocketRole::Client ? session.client_wr_shutdown : session.backend_wr_shutdown;
 }
 
+[[nodiscard]] int effective_family(const sockaddr_storage& addr) {
+    if (addr.ss_family == AF_INET) {
+        return AF_INET;
+    }
+    if (addr.ss_family == AF_INET6) {
+        const auto* sa = reinterpret_cast<const sockaddr_in6*>(&addr);
+        if (IN6_IS_ADDR_V4MAPPED(&sa->sin6_addr)) {
+            return AF_INET;
+        }
+        return AF_INET6;
+    }
+    return AF_UNSPEC;
+}
+
+[[nodiscard]] std::uint16_t sock_port(const sockaddr_storage& addr) {
+    if (addr.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<const sockaddr_in*>(&addr)->sin_port);
+    }
+    if (addr.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6*>(&addr)->sin6_port);
+    }
+    return 0;
+}
+
 [[nodiscard]] std::string peer_ip(const sockaddr_storage& addr) {
     char host[INET6_ADDRSTRLEN]{};
     if (addr.ss_family == AF_INET) {
@@ -164,6 +188,47 @@ void consume_buf(std::vector<std::uint8_t>& buf, std::size_t& head, std::size_t 
         return std::string{host};
     }
     return "unknown";
+}
+
+[[nodiscard]] std::string format_proxy_v1(
+    const sockaddr_storage& src,
+    const sockaddr_storage& dst) {
+    const std::string src_ip = peer_ip(src);
+    const std::string dst_ip = peer_ip(dst);
+    const int src_fam = effective_family(src);
+    const int dst_fam = effective_family(dst);
+    if (src_ip == "unknown" || dst_ip == "unknown") {
+        return "PROXY UNKNOWN\r\n";
+    }
+    const char* family = nullptr;
+    if (src_fam == AF_INET && dst_fam == AF_INET) {
+        family = "TCP4";
+    } else if (src_fam == AF_INET6 && dst_fam == AF_INET6) {
+        family = "TCP6";
+    } else {
+        return "PROXY UNKNOWN\r\n";
+    }
+    std::string line = "PROXY ";
+    line += family;
+    line += ' ';
+    line += src_ip;
+    line += ' ';
+    line += dst_ip;
+    line += ' ';
+    line += std::to_string(sock_port(src));
+    line += ' ';
+    line += std::to_string(sock_port(dst));
+    line += "\r\n";
+    return line;
+}
+
+[[nodiscard]] std::string make_proxy_v1_header(int client_fd, const sockaddr_storage& client_addr) {
+    sockaddr_storage local{};
+    socklen_t local_len = static_cast<socklen_t>(sizeof(local));
+    if (::getsockname(client_fd, reinterpret_cast<sockaddr*>(&local), &local_len) != 0) {
+        return "PROXY UNKNOWN\r\n";
+    }
+    return format_proxy_v1(client_addr, local);
 }
 
 }  // namespace
@@ -387,13 +452,20 @@ void ProxyServer::accept_ready() {
         UniqueFd client(raw);
         (void)set_nonblocking(client.get());
         (void)set_tcp_nodelay(client.get());
-        if (!spawn_session(std::move(client), peer_ip(addr))) {
+        std::string proxy_header;
+        if (config_.send_proxy_protocol) {
+            proxy_header = make_proxy_v1_header(client.get(), addr);
+        }
+        if (!spawn_session(std::move(client), peer_ip(addr), std::move(proxy_header))) {
             continue;
         }
     }
 }
 
-bool ProxyServer::spawn_session(UniqueFd client_fd, std::string client_ip) {
+bool ProxyServer::spawn_session(
+    UniqueFd client_fd,
+    std::string client_ip,
+    std::string proxy_header) {
     RateLimiter::Lease lease;
     if (!rate_limiter_.try_admit(client_ip, lease)) {
         return false;
@@ -411,6 +483,10 @@ bool ProxyServer::spawn_session(UniqueFd client_fd, std::string client_ip) {
     session->backend_fd = std::move(backend_fd);
     session->state = established ? SessionState::Established : SessionState::Connecting;
     session->lease = std::move(lease);
+    session->proxy_header = std::move(proxy_header);
+    if (established) {
+        inject_proxy_header(*session);
+    }
     const std::uint64_t id = next_session_id_++;
 
     if (!set_watch(
@@ -545,8 +621,21 @@ bool ProxyServer::finish_connect(std::uint64_t id) {
         return false;
     }
     session->state = SessionState::Established;
+    inject_proxy_header(*session);
     refresh_events(*session, id);
     return true;
+}
+
+void ProxyServer::inject_proxy_header(ProxySession& session) const {
+    if (session.proxy_header.empty()) {
+        return;
+    }
+    const auto* data = reinterpret_cast<const std::uint8_t*>(session.proxy_header.data());
+    session.to_backend_buf.insert(
+        session.to_backend_buf.begin() + static_cast<std::ptrdiff_t>(session.to_backend_head),
+        data,
+        data + session.proxy_header.size());
+    session.proxy_header.clear();
 }
 
 bool ProxyServer::pump_read(std::uint64_t id, SocketRole src) {

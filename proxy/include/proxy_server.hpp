@@ -22,6 +22,7 @@ struct ProxyConfig {
     std::size_t max_per_ip{5};
     std::uint32_t rate_limit{10};
     std::uint32_t rate_burst{15};
+    bool send_proxy_protocol{true};
 };
 
 enum class SessionState : std::uint8_t {
@@ -50,6 +51,7 @@ struct ProxySession {
     std::uint32_t client_events{0};
     std::uint32_t backend_events{0};
     RateLimiter::Lease lease;
+    std::string proxy_header;
 };
 
 class ProxyServer {
@@ -74,7 +76,11 @@ private:
     [[nodiscard]] bool setup_epoll();
     void teardown() noexcept;
     void accept_ready();
-    [[nodiscard]] bool spawn_session(UniqueFd client_fd, std::string client_ip);
+    [[nodiscard]] bool spawn_session(
+        UniqueFd client_fd,
+        std::string client_ip,
+        std::string proxy_header);
+    void inject_proxy_header(ProxySession& session) const;
     [[nodiscard]] bool open_backend(UniqueFd& out_fd, bool& established);
     void handle_event(std::uint64_t token, std::uint32_t events);
     void handle_session_event(std::uint64_t id, SocketRole role, std::uint32_t events);

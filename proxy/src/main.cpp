@@ -24,6 +24,8 @@ constexpr std::string_view kUsage =
     "      --max-per-ip <n>       Maximum concurrent connections per IP (default: 5)\n"
     "      --rate-limit <n>       Maximum new connections per IP per second (default: 10)\n"
     "      --rate-burst <n>       Rate limiter burst size per IP (default: 15)\n"
+    "      --send-proxy-protocol   Send PROXY Protocol v1 to the backend (default)\n"
+    "      --no-send-proxy-protocol Disable PROXY Protocol v1\n"
     "      --dry-run              Initialize the listen socket, print config, and exit\n"
     "      --help                 Show this help and exit\n";
 
@@ -98,6 +100,7 @@ void print_config(const honeypot::ProxyConfig& cfg, bool dry_run) {
               << " max_per_ip=" << cfg.max_per_ip
               << " rate_limit=" << cfg.rate_limit
               << " rate_burst=" << cfg.rate_burst
+              << " send_proxy_protocol=" << (cfg.send_proxy_protocol ? "true" : "false")
               << " dry_run=" << (dry_run ? "true" : "false")
               << std::endl;
 }
@@ -219,6 +222,14 @@ int main(int argc, char** argv) {
                 std::cerr << "[honeypot_proxy] invalid rate-burst\n";
                 return 2;
             }
+            continue;
+        }
+        if (arg == "--send-proxy-protocol") {
+            config.send_proxy_protocol = true;
+            continue;
+        }
+        if (arg == "--no-send-proxy-protocol") {
+            config.send_proxy_protocol = false;
             continue;
         }
         std::cerr << "[honeypot_proxy] unknown option: " << arg << '\n';
