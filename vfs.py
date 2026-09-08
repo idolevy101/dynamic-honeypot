@@ -43,7 +43,7 @@ PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-poli
 UBUNTU_CODENAME=jammy
 """
 
-ISSUE: Final[str] = "Ubuntu 22.04.3 LTS \\n \\l\n"
+ISSUE: Final[str] = "Ubuntu 22.04.3 LTS \\n \\l\n\n"
 
 PROC_VERSION: Final[str] = (
     f"Linux version {KERNEL_RELEASE} (buildd@lcy02-amd64-044) "
@@ -213,6 +213,7 @@ class INode:
     owner: str = "root"
     group: str = "root"
     mtime: datetime = _DEFAULT_MTIME
+    char_device: bool = False
 
     @property
     def size(self) -> int:
@@ -222,15 +223,22 @@ class INode:
     def nlink(self) -> int:
         return 1
 
+    @property
+    def ls_kind(self) -> str:
+        return "c" if self.char_device else "-"
+
 
 @dataclass
 class VFSFile(INode):
     """Regular file whose contents live entirely in memory."""
 
     content: str = ""
+    reported_size: int | None = None
 
     @property
     def size(self) -> int:
+        if self.reported_size is not None and not self.content:
+            return self.reported_size
         return len(self.content.encode("utf-8"))
 
 
@@ -248,6 +256,10 @@ class VFSDirectory(INode):
     def nlink(self) -> int:
         subdirs = sum(1 for child in self.children.values() if isinstance(child, VFSDirectory))
         return 2 + subdirs
+
+    @property
+    def ls_kind(self) -> str:
+        return "d"
 
 
 def canonicalize(path: str, cwd: str, home: str = DEFAULT_HOME) -> str:
@@ -289,6 +301,68 @@ def _file(name: str, content: str, mode: int = 0o644) -> VFSFile:
     return VFSFile(name=name, content=content, mode=mode)
 
 
+def _char_device(name: str, mode: int = 0o666) -> VFSFile:
+    return VFSFile(name=name, content="", mode=mode, char_device=True)
+
+
+_STUB_BINARIES: Final[tuple[str, ...]] = (
+    "bash",
+    "sh",
+    "ls",
+    "cat",
+    "grep",
+    "cp",
+    "mv",
+    "rm",
+    "mkdir",
+    "rmdir",
+    "touch",
+    "chmod",
+    "chown",
+    "ps",
+    "kill",
+    "killall",
+    "free",
+    "uptime",
+    "df",
+    "uname",
+    "whoami",
+    "id",
+    "hostname",
+    "wget",
+    "curl",
+    "tar",
+    "gzip",
+    "sed",
+    "awk",
+    "find",
+    "netstat",
+    "ss",
+    "iptables",
+    "systemctl",
+)
+_STUB_SIZE_MIN: Final[int] = 30 * 1024
+_STUB_SIZE_MAX: Final[int] = 800 * 1024
+DEV_NULL: Final[str] = "/dev/null"
+
+
+def _stub_size(name: str) -> int:
+    acc = 2166136261
+    for char in name:
+        acc ^= ord(char)
+        acc = (acc * 16777619) & 0xFFFFFFFF
+    span = _STUB_SIZE_MAX - _STUB_SIZE_MIN
+    return _STUB_SIZE_MIN + (acc % (span + 1))
+
+
+def _binary_stub(name: str) -> VFSFile:
+    return VFSFile(name=name, content="", mode=0o755, reported_size=_stub_size(name))
+
+
+def _bin_stubs() -> tuple[VFSFile, ...]:
+    return tuple(_binary_stub(name) for name in _STUB_BINARIES)
+
+
 def build_honeypot_tree() -> VFSDirectory:
     """Populate the default Ubuntu-like honeypot tree (never touches the host disk)."""
     etc = _directory(
@@ -312,14 +386,22 @@ def build_honeypot_tree() -> VFSDirectory:
         mode=0o700,
     )
     home = _directory("home", _directory("ubuntu", mode=0o755))
+    dev = _directory(
+        "dev",
+        _char_device("null"),
+        _char_device("zero"),
+        _char_device("urandom"),
+    )
     return _directory(
         "",
-        _directory("bin"),
+        _directory("bin", *_bin_stubs()),
+        dev,
         etc,
         home,
         proc,
         root_home,
         _directory("tmp", mode=0o1777),
+        _directory("usr", _directory("bin", *_bin_stubs())),
         _directory("var", _directory("log")),
     )
 
@@ -476,6 +558,8 @@ class VirtualFileSystem:
 
     def write_file(self, path: str, content: str, cwd: str, append: bool = False) -> None:
         abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == DEV_NULL:
+            return
         if abs_path == "/":
             raise IsADirectoryError("/")
         parent = parent_path(abs_path)

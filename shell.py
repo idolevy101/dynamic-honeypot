@@ -12,7 +12,7 @@ import shlex
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final, Sequence
+from typing import Any, Final, Protocol, Sequence
 from urllib.parse import urlparse
 
 from llm import LLMProvider, NullLLMProvider
@@ -385,6 +385,43 @@ _UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset(
 )
 
 
+_STDERR_REDIRECTS: Final[frozenset[str]] = frozenset({"2>&1", "2>/dev/null"})
+_SYSTEM_BIN_PREFIXES: Final[tuple[str, ...]] = ("/usr/bin/", "/sbin/", "/bin/")
+_SHELL_WRAPPERS: Final[frozenset[str]] = frozenset({"sh", "bash", "dash"})
+_HANDLER_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "pwd",
+        "cd",
+        "ls",
+        "cat",
+        "grep",
+        "touch",
+        "echo",
+        "true",
+        "false",
+        "mkdir",
+        "rm",
+        "rmdir",
+        "chmod",
+        "wget",
+        "curl",
+        "which",
+        "uname",
+        "env",
+        "exit",
+        "logout",
+        "history",
+        "unset",
+    }
+)
+_KNOWN_COMMANDS: Final[frozenset[str]] = (
+    _HANDLER_NAMES
+    | _SHELL_WRAPPERS
+    | _STATIC_HANDLER_COMMANDS
+    | frozenset(key[0] for key in _STATIC_OUTPUTS)
+)
+
+
 def _parse_redirection(tokens: Sequence[str]) -> tuple[list[str], str | None, bool]:
     command: list[str] = []
     redirect_path: str | None = None
@@ -392,6 +429,12 @@ def _parse_redirection(tokens: Sequence[str]) -> tuple[list[str], str | None, bo
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        if token == "2>" and index + 1 < len(tokens):
+            index += 2
+            continue
+        if token in _STDERR_REDIRECTS or token.startswith("2>"):
+            index += 1
+            continue
         if token in (">", ">>"):
             if index + 1 >= len(tokens):
                 raise ValueError("bash: syntax error near unexpected token `newline'")
@@ -402,6 +445,36 @@ def _parse_redirection(tokens: Sequence[str]) -> tuple[list[str], str | None, bo
         command.append(token)
         index += 1
     return command, redirect_path, append
+
+
+def _strip_system_prefix(command: str) -> str:
+    for prefix in _SYSTEM_BIN_PREFIXES:
+        if not command.startswith(prefix):
+            continue
+        rest = command[len(prefix) :]
+        if rest and "/" not in rest:
+            return rest
+    return command
+
+
+def _is_explicit_path(command: str) -> bool:
+    return (
+        command.startswith("/")
+        or command.startswith("./")
+        or command.startswith("../")
+        or "/" in command
+    )
+
+
+def _extract_shell_c(tokens: Sequence[str]) -> str | None:
+    for index, token in enumerate(tokens):
+        if token == "-c" and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+class _CwdPersist(Protocol):
+    cwd: str
 
 
 @dataclass(frozen=True)
@@ -749,8 +822,25 @@ class CommandResult:
         return self.exit_code == 0
 
 
+def _ensure_trailing_newline(text: str) -> str:
+    if text and not text.endswith("\n"):
+        return text + "\n"
+    return text
+
+
+def _join_outputs(chunks: Sequence[str]) -> str:
+    merged = ""
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if merged and not merged.endswith("\n"):
+            merged += "\n"
+        merged += chunk
+    return merged
+
+
 def _fail(output: str, *, exit_code: int = 1) -> CommandResult:
-    return CommandResult(output=output, exit_code=exit_code)
+    return CommandResult(output=_ensure_trailing_newline(output), exit_code=exit_code)
 
 
 class Shell:
@@ -765,14 +855,26 @@ class Shell:
         *,
         session_id: str = "local",
         client_ip: str = "unknown",
+        cwd: str | None = None,
+        ip_session: _CwdPersist | None = None,
     ) -> None:
         self._vfs = vfs
-        self._state = state if state is not None else SessionState(home=vfs.home)
+        self._ip_session = ip_session
+        if state is not None:
+            self._state = state
+        else:
+            start_cwd = cwd
+            if start_cwd is None and ip_session is not None:
+                start_cwd = ip_session.cwd
+            if start_cwd is None:
+                start_cwd = vfs.home
+            self._state = SessionState(cwd=start_cwd, home=vfs.home)
         self._llm_provider = llm_provider if llm_provider is not None else NullLLMProvider()
         self._llm_cache: dict[str, str] = llm_cache if llm_cache is not None else {}
         self._session_id = session_id
         self._client_ip = client_ip
         self._captured_artifacts: list[str] = []
+        self._command_extra: dict[str, Any] = {}
         self._handlers = {
             "pwd": self._cmd_pwd,
             "cd": self._cmd_cd,
@@ -794,6 +896,8 @@ class Shell:
             "env": self._cmd_env,
             "exit": self._cmd_exit,
             "logout": self._cmd_exit,
+            "history": self._cmd_history,
+            "unset": self._cmd_unset,
         }
 
     @property
@@ -818,7 +922,7 @@ class Shell:
             if last.exit_session:
                 break
         return CommandResult(
-            output="".join(outputs),
+            output=_join_outputs(outputs),
             exit_session=last.exit_session,
             exit_code=last.exit_code,
             execution_path=last.execution_path,
@@ -843,7 +947,7 @@ class Shell:
             if last.exit_session:
                 break
         return CommandResult(
-            output="".join(outputs),
+            output=_join_outputs(outputs),
             exit_session=last.exit_session,
             exit_code=last.exit_code,
             execution_path=last.execution_path,
@@ -868,6 +972,7 @@ class Shell:
             return CommandResult()
         started = time.perf_counter()
         self._captured_artifacts = []
+        self._command_extra = {}
         execution_path = "vfs"
         result = CommandResult()
         try:
@@ -906,6 +1011,7 @@ class Shell:
                 execution_path=execution_path,
                 duration_ms=duration_ms,
                 captured_artifacts=self._captured_artifacts,
+                extra=self._command_extra or None,
             )
         stamped = CommandResult(
             output=result.output,
@@ -960,6 +1066,20 @@ class Shell:
         self, tokens: list[str], stripped: str, stdin: str = ""
     ) -> tuple[CommandResult, str]:
         command, *args = tokens
+        basename = _strip_system_prefix(command)
+        if basename != command and basename in _KNOWN_COMMANDS:
+            command = basename
+            tokens = [command, *args]
+            stripped = " ".join(tokens) if args else command
+        if command in _SHELL_WRAPPERS:
+            inner = _extract_shell_c(tokens)
+            if inner is not None:
+                inner_result = await self.execute(inner)
+                return inner_result, inner_result.execution_path
+            return CommandResult(), "vfs"
+        if _is_explicit_path(command):
+            trapped = self._exec_trap(command)
+            return trapped, trapped.execution_path or "exec_trap"
         handler = self._handlers.get(command)
         if handler is not None:
             if command in {"wget", "curl"}:
@@ -981,8 +1101,10 @@ class Shell:
         cache_key = stripped if not stdin else f"{stripped}\0{stdin}"
         if cacheable and cache_key in self._llm_cache:
             output = self._llm_cache[cache_key]
-            exit_code = 127 if "command not found" in output else 0
-            return CommandResult(output, exit_code=exit_code), "cache"
+            if "command not found" in output:
+                output = _ensure_trailing_newline(output)
+                return CommandResult(output, exit_code=127), "cache"
+            return CommandResult(output, exit_code=0), "cache"
         context = self._llm_context()
         if stdin:
             context["stdin"] = stdin
@@ -994,8 +1116,10 @@ class Shell:
         )
         if cacheable:
             self._llm_cache[cache_key] = output
-        exit_code = 127 if "command not found" in output else 0
-        return CommandResult(output, exit_code=exit_code), "llm"
+        if "command not found" in output:
+            output = _ensure_trailing_newline(output)
+            return CommandResult(output, exit_code=127), "llm"
+        return CommandResult(output, exit_code=0), "llm"
 
     def _llm_context(self) -> dict[str, Any]:
         try:
@@ -1034,6 +1158,8 @@ class Shell:
             return _fail(f"bash: cd: {raw}: Not a directory")
         self._state.oldpwd = self._state.cwd
         self._state.cwd = target
+        if self._ip_session is not None:
+            self._ip_session.cwd = target
         return CommandResult(target if announce else "")
 
     def _cmd_ls(self, args: list[str]) -> CommandResult:
@@ -1389,6 +1515,52 @@ class Shell:
     def _cmd_exit(self, _args: list[str]) -> CommandResult:
         return CommandResult(exit_session=True)
 
+    def _cmd_history(self, _args: list[str]) -> CommandResult:
+        return CommandResult()
+
+    def _cmd_unset(self, _args: list[str]) -> CommandResult:
+        return CommandResult()
+
+    def _exec_trap(self, path: str) -> CommandResult:
+        try:
+            node = self._vfs.resolve(path, self._state.cwd)
+        except FileNotFoundError:
+            return CommandResult(
+                output=_ensure_trailing_newline(f"bash: {path}: No such file or directory"),
+                exit_code=127,
+                execution_path="exec_trap",
+            )
+        except NotADirectoryError:
+            return CommandResult(
+                output=_ensure_trailing_newline(f"bash: {path}: No such file or directory"),
+                exit_code=127,
+                execution_path="exec_trap",
+            )
+        if isinstance(node, VFSDirectory):
+            return CommandResult(
+                output=_ensure_trailing_newline(f"bash: {path}: Is a directory"),
+                exit_code=126,
+                execution_path="exec_trap",
+            )
+        if not (node.mode & 0o111):
+            return CommandResult(
+                output=_ensure_trailing_newline(f"bash: {path}: Permission denied"),
+                exit_code=126,
+                execution_path="exec_trap",
+            )
+        abs_path = canonicalize(path, self._state.cwd, self._state.home)
+        self._command_extra = {
+            "target_path": abs_path,
+            "file_metadata": {
+                "name": node.name,
+                "mode": node.mode,
+                "size": node.size,
+                "owner": node.owner,
+                "group": node.group,
+            },
+        }
+        return CommandResult(execution_path="exec_trap")
+
     def _format_ls_dir(
         self,
         directory: VFSDirectory,
@@ -1423,11 +1595,10 @@ class Shell:
         return "\n".join(lines)
 
     def _format_ls_file(self, node: INode, display: str, long_fmt: bool) -> str:
-        name = display.rstrip("/").rsplit("/", 1)[-1] or display
-        if not long_fmt:
-            return name
-        mode, nlink, owner, group, size, mtime = _ls_long_fields(node)
-        return f"{mode} {nlink} {owner} {group} {size} {mtime} {name}"
+        if long_fmt:
+            mode, nlink, owner, group, size, mtime = _ls_long_fields(node)
+            return f"{mode} {nlink} {owner} {group} {size} {mtime} {display}"
+        return display.rstrip("/").rsplit("/", 1)[-1] or display
 
 
 def _ls_blocks(node: INode) -> int:
@@ -1436,7 +1607,7 @@ def _ls_blocks(node: INode) -> int:
 
 
 def _ls_long_fields(node: INode) -> tuple[str, str, str, str, str, str]:
-    kind = "d" if isinstance(node, VFSDirectory) else "-"
+    kind = node.ls_kind
     return (
         kind + _perm_string(node.mode),
         str(node.nlink),

@@ -95,6 +95,9 @@ class HoneypotServer(asyncssh.SSHServer):
     def kbdint_auth_supported(self) -> bool:
         return False
 
+    def command_requested(self, command: str) -> bool:
+        return True
+
     async def validate_password(self, username: str, password: str) -> bool:
         if self._session_id is None or self._client_ip is None:
             return False
@@ -163,6 +166,12 @@ def _stdout_crlf(text: str) -> str:
     return "".join(f"{line}\r\n" for line in lines)
 
 
+def _ensure_trailing_newline(text: str) -> str:
+    if text and not text.endswith("\n"):
+        return f"{text}\n"
+    return text
+
+
 async def handle_client(
     process: asyncssh.SSHServerProcess[str],
     llm_provider: LLMProvider,
@@ -176,27 +185,38 @@ async def handle_client(
         llm_cache=record.llm_cache,
         session_id=session_id,
         client_ip=client_ip,
+        cwd=record.cwd,
+        ip_session=record,
     )
+    exit_code = 0
     try:
-        process.stdout.write(f"{BANNER}\r\n")
-        while True:
-            process.stdout.write(shell.prompt())
-            line = await process.stdin.readline()
-            if not line:
-                break
-            result = await shell.execute(line.rstrip("\r\n"))
+        command = process.command
+        if command:
+            result = await shell.execute(command)
             if result.output:
-                process.stdout.write(_stdout_crlf(result.output))
-            if result.exit_session:
-                break
+                process.stdout.write(_ensure_trailing_newline(result.output))
+            exit_code = result.exit_code
+        else:
+            process.stdout.write(f"{BANNER}\r\n")
+            while True:
+                process.stdout.write(shell.prompt())
+                line = await process.stdin.readline()
+                if not line:
+                    break
+                result = await shell.execute(line.rstrip("\r\n"))
+                if result.output:
+                    process.stdout.write(_stdout_crlf(result.output))
+                if result.exit_session:
+                    break
     except asyncio.CancelledError:
         raise
     except _DISCONNECT_ERRORS:
         pass
     finally:
+        record.cwd = shell.state.cwd
         session_manager.touch(client_ip)
         try:
-            process.exit(0)
+            process.exit(exit_code)
             process.close()
             await process.wait_closed()
         except _DISCONNECT_ERRORS:

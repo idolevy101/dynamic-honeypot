@@ -8,7 +8,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from vfs import VirtualFileSystem, create_default_vfs
+from vfs import DEFAULT_HOME, VirtualFileSystem, create_default_vfs
 
 DEFAULT_MAX_SESSIONS = 500
 DEFAULT_TTL_SECONDS = 3600.0
@@ -19,6 +19,7 @@ class IpSession:
     vfs: VirtualFileSystem
     llm_cache: dict[str, str] = field(default_factory=dict)
     last_seen: float = 0.0
+    cwd: str = DEFAULT_HOME
 
 
 class SessionManager:

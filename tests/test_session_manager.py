@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from auth import AuthManager
 from llm import NullLLMProvider
-from server import _periodic_sweep
+from server import BANNER, HoneypotServer, handle_client, _periodic_sweep
 from session_manager import SessionManager
 from shell import Shell
 from vfs import create_default_vfs
@@ -135,3 +135,93 @@ async def test_periodic_sweep_clears_idle_session_and_pin() -> None:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def test_reconnect_retains_cwd_after_cd() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    first = manager.get_or_create(IP_A)
+    shell = Shell(
+        first.vfs,
+        llm_provider=NullLLMProvider(),
+        cwd=first.cwd,
+        ip_session=first,
+    )
+    result = await shell.execute("cd /tmp")
+    assert result.exit_code == 0
+    assert first.cwd == "/tmp"
+
+    second = manager.get_or_create(IP_A)
+    assert second is first
+    assert second.cwd == "/tmp"
+    reconnect = Shell(
+        second.vfs,
+        llm_provider=NullLLMProvider(),
+        cwd=second.cwd,
+        ip_session=second,
+    )
+    assert reconnect.state.cwd == "/tmp"
+    pwd = await reconnect.execute("pwd")
+    assert pwd.output == "/tmp"
+
+
+def test_command_requested_accepts_noninteractive_exec() -> None:
+    server = HoneypotServer(AuthManager(), SessionManager())
+    assert server.command_requested("id") is True
+    assert server.command_requested("cat /etc/passwd") is True
+
+
+class _FakeStdout:
+    def __init__(self) -> None:
+        self.chunks: list[str] = []
+
+    def write(self, data: str) -> None:
+        self.chunks.append(data)
+
+    @property
+    def text(self) -> str:
+        return "".join(self.chunks)
+
+
+class _FakeProcess:
+    def __init__(self, command: str | None) -> None:
+        self.command = command
+        self.stdout = _FakeStdout()
+        self.stdin = MagicMock()
+        self.stdin.readline = AsyncMock(return_value="")
+        self.channel = MagicMock()
+        self.channel.get_connection.side_effect = AttributeError
+        self.exit_code: int | None = None
+        self.closed = False
+
+    def exit(self, code: int) -> None:
+        self.exit_code = code
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+    def get_extra_info(self, _name: str, default: object = None) -> object:
+        return default
+
+
+async def test_noninteractive_exec_runs_without_banner_or_prompt() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeProcess('echo unwrapped')
+    await handle_client(process, NullLLMProvider(), manager)
+    assert BANNER not in process.stdout.text
+    assert "root@ubuntu-srv" not in process.stdout.text
+    assert process.stdout.text == "unwrapped\n"
+    assert process.exit_code == 0
+    assert process.closed is True
+    process.stdin.readline.assert_not_called()
+
+
+async def test_noninteractive_exec_output_ends_with_newline() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeProcess("pwd")
+    await handle_client(process, NullLLMProvider(), manager)
+    assert process.stdout.text == "/root\n"
+    assert process.stdout.text.endswith("\n")
+    assert process.exit_code == 0

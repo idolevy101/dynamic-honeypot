@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, Literal
 
 from sinkhole import iso_utc_now
 
@@ -18,6 +18,11 @@ AUTH_LOG_PATH: Final[Path] = Path("logs") / "auth_attempts.jsonl"
 
 _SAFE_SESSION_CHARS: Final[str] = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+)
+
+ExecutionPath = Literal["vfs", "static", "sinkhole", "llm", "cache", "exec_trap"]
+EXECUTION_PATHS: Final[frozenset[str]] = frozenset(
+    ("vfs", "static", "sinkhole", "llm", "cache", "exec_trap")
 )
 
 
@@ -41,11 +46,12 @@ async def record_command(
     session_id: str,
     client_ip: str,
     command: str,
-    execution_path: str,
+    execution_path: ExecutionPath | str,
     duration_ms: float,
     captured_artifacts: Iterable[str] = (),
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    record = {
+    record: dict[str, Any] = {
         "timestamp": iso_utc_now(),
         "session_id": session_id,
         "client_ip": client_ip,
@@ -54,6 +60,8 @@ async def record_command(
         "duration_ms": duration_ms,
         "captured_artifacts": list(captured_artifacts),
     }
+    if extra:
+        record.update(extra)
     path = SESSION_LOG_DIR / f"{_safe_session_id(session_id)}.jsonl"
     try:
         await asyncio.to_thread(_append_jsonl, path, record)

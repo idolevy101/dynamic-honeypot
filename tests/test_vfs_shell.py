@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -11,8 +12,10 @@ from shell import CommandResult, SessionState, Shell, format_uname, lookup_stati
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
+    ISSUE,
     KERNEL_RELEASE,
     OS_RELEASE,
+    PASSWD,
     PROC_VERSION,
     UNAME_A,
     VFSDirectory,
@@ -137,20 +140,20 @@ async def test_cd_dash_without_oldpwd() -> None:
         llm_provider=NullLLMProvider(),
     )
     result = await shell.execute("cd -")
-    assert result.output == "bash: cd: OLDPWD not set"
+    assert result.output == "bash: cd: OLDPWD not set\n"
     assert shell.state.cwd == "/root"
 
 
 async def test_cd_errors(shell: Shell) -> None:
     missing = await shell.execute("cd /nope")
-    assert missing.output == "bash: cd: /nope: No such file or directory"
+    assert missing.output == "bash: cd: /nope: No such file or directory\n"
     assert shell.state.cwd == "/root"
 
     not_dir = await shell.execute("cd /etc/passwd")
-    assert not_dir.output == "bash: cd: /etc/passwd: Not a directory"
+    assert not_dir.output == "bash: cd: /etc/passwd: Not a directory\n"
 
     too_many = await shell.execute("cd /tmp /var")
-    assert too_many.output == "bash: cd: too many arguments"
+    assert too_many.output == "bash: cd: too many arguments\n"
 
 
 async def test_ls_default_hides_dotfiles(shell: Shell) -> None:
@@ -194,13 +197,13 @@ async def test_ls_long_and_combined_flags(shell: Shell) -> None:
 
     file_long = await shell.execute("ls -l /etc/hostname")
     assert file_long.output.startswith("-")
-    assert file_long.output.endswith(" hostname")
+    assert file_long.output.endswith(" /etc/hostname")
 
 
 async def test_ls_missing_path(shell: Shell) -> None:
     result = await shell.execute("ls /does-not-exist")
     assert result.output == (
-        "ls: cannot access '/does-not-exist': No such file or directory"
+        "ls: cannot access '/does-not-exist': No such file or directory\n"
     )
 
 
@@ -232,7 +235,7 @@ async def test_empty_and_whitespace_input_is_noop(shell: Shell) -> None:
 
 async def test_unknown_command_message(shell: Shell) -> None:
     result = await shell.execute("nosuchcmd")
-    assert result.output == "bash: nosuchcmd: command not found"
+    assert result.output == "bash: nosuchcmd: command not found\n"
     assert not result.exit_session
     assert result.execution_path == "llm"
 
@@ -246,7 +249,7 @@ async def test_shlex_quote_handling(shell: Shell) -> None:
     assert "os-release" in double.output
 
     unknown_quoted = await shell.execute('xyzzy "root"')
-    assert unknown_quoted.output == "bash: xyzzy: command not found"
+    assert unknown_quoted.output == "bash: xyzzy: command not found\n"
 
 
 async def test_exit_and_logout(shell: Shell) -> None:
@@ -886,7 +889,7 @@ async def test_empty_redirect_creates_zero_byte_file(shell: Shell) -> None:
 async def test_redirect_missing_parent_directory(shell: Shell) -> None:
     result = await shell.execute("echo hi > /no/such/file.txt")
     assert result.exit_code == 1
-    assert result.output == "bash: /no/such/file.txt: No such file or directory"
+    assert result.output == "bash: /no/such/file.txt: No such file or directory\n"
 
 
 async def test_pipeline_echo_grep_matching_line(shell: Shell) -> None:
@@ -920,3 +923,142 @@ async def test_pipeline_unknown_command_receives_stdin(vfs: VirtualFileSystem) -
     assert "hello" in command
     assert context is not None
     assert context["stdin"] == "hello\n"
+
+
+async def test_bin_cat_passthrough_executes_cat(shell: Shell) -> None:
+    result = await shell.execute("/bin/cat /etc/passwd")
+    assert result.output == PASSWD
+    assert result.exit_code == 0
+    assert result.execution_path == "vfs"
+
+
+async def test_sh_c_unwraps_inner_command(shell: Shell) -> None:
+    quoted = await shell.execute('sh -c "echo unwrapped"')
+    assert quoted.output == "unwrapped\n"
+    assert quoted.exit_code == 0
+    bin_sh = await shell.execute('/bin/sh -c "echo unwrapped"')
+    assert bin_sh.output == "unwrapped\n"
+    assert bin_sh.exit_code == 0
+    bash_c = await shell.execute('bash -c "echo unwrapped"')
+    assert bash_c.output == "unwrapped\n"
+    assert bash_c.exit_code == 0
+
+
+async def test_nonexistent_path_execution_returns_127(shell: Shell) -> None:
+    result = await shell.execute("./nonexistent")
+    assert result.exit_code == 127
+    assert result.output == "bash: ./nonexistent: No such file or directory\n"
+    assert result.execution_path == "exec_trap"
+
+
+async def test_non_executable_file_returns_permission_denied(shell: Shell) -> None:
+    result = await shell.execute("touch /tmp/s.sh && /tmp/s.sh")
+    assert result.exit_code == 126
+    assert result.output == "bash: /tmp/s.sh: Permission denied\n"
+    assert result.execution_path == "exec_trap"
+
+
+async def test_executable_file_is_exec_trap(
+    vfs: VirtualFileSystem,
+) -> None:
+    provider = RecordingLLMProvider()
+    shell = Shell(vfs, llm_provider=provider, session_id="trap-sess")
+    await shell.execute("touch /tmp/s.sh")
+    chmod = await shell.execute("chmod +x /tmp/s.sh")
+    assert chmod.exit_code == 0
+    result = await shell.execute("/tmp/s.sh")
+    assert result.exit_code == 0
+    assert result.output == ""
+    assert result.execution_path == "exec_trap"
+    assert provider.calls == []
+    log_path = Path("logs/sessions/trap-sess.jsonl")
+    records = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trapped = [row for row in records if row["execution_path"] == "exec_trap"]
+    assert trapped
+    assert trapped[-1]["command"] == "/tmp/s.sh"
+    assert trapped[-1]["target_path"] == "/tmp/s.sh"
+
+
+async def test_ls_bin_contains_standard_binaries(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    listing = await shell.execute("ls /bin")
+    names = listing.output.split("  ")
+    for expected in ("bash", "sh", "curl", "wget"):
+        assert expected in names
+    long_bash = await shell.execute("ls -l /bin/bash")
+    assert long_bash.output.startswith("-rwxr-xr-x")
+    assert long_bash.output.endswith(" /bin/bash")
+    node = vfs.get("/bin/bash", "/")
+    assert isinstance(node, VFSFile)
+    assert node.mode == 0o755
+    assert 30 * 1024 <= node.size <= 800 * 1024
+
+
+async def test_dev_null_empty_read_and_discarded_write(
+    shell: Shell, vfs: VirtualFileSystem
+) -> None:
+    empty = await shell.execute("cat /dev/null")
+    assert empty.output == ""
+    assert empty.exit_code == 0
+    written = await shell.execute("echo foo > /dev/null")
+    assert written.output == ""
+    assert written.exit_code == 0
+    node = vfs.get("/dev/null", "/")
+    assert node.size == 0
+    assert vfs.read_file("/dev/null", "/") == ""
+
+
+async def test_trace_cleanup_builtins(shell: Shell) -> None:
+    history = await shell.execute("history -c")
+    assert history.output == ""
+    assert history.exit_code == 0
+    unset = await shell.execute("unset HISTFILE")
+    assert unset.output == ""
+    assert unset.exit_code == 0
+
+
+async def test_stderr_redirect_suffix_is_stripped(shell: Shell) -> None:
+    discarded = await shell.execute("echo hello 2>/dev/null")
+    assert discarded.output == "hello\n"
+    assert discarded.exit_code == 0
+    merged = await shell.execute("echo hello 2>&1")
+    assert merged.output == "hello\n"
+    assert merged.exit_code == 0
+
+
+async def test_chained_command_outputs_are_newline_separated(shell: Shell) -> None:
+    result = await shell.execute("nonexistent_cmd; echo next")
+    assert result.output == "bash: nonexistent_cmd: command not found\nnext\n"
+    assert "command not foundnext" not in result.output
+    assert result.output.splitlines() == [
+        "bash: nonexistent_cmd: command not found",
+        "next",
+    ]
+    and_chain = await shell.execute("nosuchcmd && echo skipped; echo after")
+    assert and_chain.output == "bash: nosuchcmd: command not found\nafter\n"
+
+
+async def test_cat_etc_issue_getty_escapes(shell: Shell) -> None:
+    result = await shell.execute("cat /etc/issue")
+    assert result.output == ISSUE
+    assert result.output == "Ubuntu 22.04.3 LTS \\n \\l\n\n"
+    assert "LTS \\n \\l" in result.output
+    assert "LTS\\n" not in result.output
+    assert result.output.endswith("\n\n")
+
+
+async def test_ls_dev_null_is_character_device(shell: Shell) -> None:
+    result = await shell.execute("ls -l /dev/null")
+    assert result.exit_code == 0
+    assert result.output.startswith("crw-rw-rw-")
+    assert result.output.endswith(" /dev/null")
+    assert "/dev/null" in result.output
+    zero = await shell.execute("ls -l /dev/zero")
+    assert zero.output.startswith("c")
+    assert zero.output.endswith(" /dev/zero")
+    urandom = await shell.execute("ls -l /dev/urandom")
+    assert urandom.output.startswith("c")
+    assert urandom.output.endswith(" /dev/urandom")
