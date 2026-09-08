@@ -728,6 +728,7 @@ class Shell:
             "mkdir": self._cmd_mkdir,
             "rm": self._cmd_rm,
             "rmdir": self._cmd_rmdir,
+            "chmod": self._cmd_chmod,
             "wget": self._cmd_wget,
             "curl": self._cmd_curl,
             "which": self._cmd_which,
@@ -1003,6 +1004,11 @@ class Shell:
         parents = False
         paths: list[str] = []
         for arg in args:
+            if arg in ("-p", "--parents"):
+                parents = True
+                continue
+            if arg.startswith("--"):
+                continue
             if arg.startswith("-") and arg != "-":
                 if "p" in arg[1:]:
                     parents = True
@@ -1031,6 +1037,14 @@ class Shell:
         force = False
         paths: list[str] = []
         for arg in args:
+            if arg in ("-r", "-R", "--recursive"):
+                recursive = True
+                continue
+            if arg in ("-f", "--force"):
+                force = True
+                continue
+            if arg.startswith("--"):
+                continue
             if arg.startswith("-") and arg != "-":
                 flags = arg[1:]
                 if "r" in flags or "R" in flags:
@@ -1046,19 +1060,19 @@ class Shell:
         chunks: list[str] = []
         for path in paths:
             try:
-                if self._vfs.is_dir(path, self._state.cwd) and not recursive:
-                    chunks.append(f"rm: cannot remove '{path}': Is a directory\n")
-                    continue
-                self._vfs.remove(path, self._state.cwd, recursive=recursive)
+                self._vfs.remove(
+                    path, self._state.cwd, recursive=recursive, force=force
+                )
             except FileNotFoundError:
-                if not force:
-                    chunks.append(
-                        f"rm: cannot remove '{path}': No such file or directory\n"
-                    )
-            except OSError:
-                chunks.append(f"rm: cannot remove '{path}': Directory not empty\n")
+                chunks.append(
+                    f"rm: cannot remove '{path}': No such file or directory\n"
+                )
+            except IsADirectoryError:
+                chunks.append(f"rm: cannot remove '{path}': Is a directory\n")
             except NotADirectoryError:
                 chunks.append(f"rm: cannot remove '{path}': Not a directory\n")
+            except OSError:
+                chunks.append(f"rm: cannot remove '{path}': Directory not empty\n")
         return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_rmdir(self, args: list[str]) -> CommandResult:
@@ -1074,20 +1088,15 @@ class Shell:
         chunks: list[str] = []
         for path in paths:
             try:
-                if self._vfs.exists(path, self._state.cwd) and not self._vfs.is_dir(
-                    path, self._state.cwd
-                ):
-                    chunks.append(f"rmdir: failed to remove '{path}': Not a directory\n")
-                    continue
-                self._vfs.remove(path, self._state.cwd, recursive=False)
+                self._vfs.rmdir(path, self._state.cwd)
             except FileNotFoundError:
                 chunks.append(
                     f"rmdir: failed to remove '{path}': No such file or directory\n"
                 )
-            except OSError:
-                chunks.append(f"rmdir: failed to remove '{path}': Directory not empty\n")
             except NotADirectoryError:
                 chunks.append(f"rmdir: failed to remove '{path}': Not a directory\n")
+            except OSError:
+                chunks.append(f"rmdir: failed to remove '{path}': Directory not empty\n")
         return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_touch(self, args: list[str]) -> CommandResult:
@@ -1098,11 +1107,40 @@ class Shell:
         chunks: list[str] = []
         for path in args:
             try:
-                self._vfs.touch_file(path, self._state.cwd)
+                self._vfs.touch(path, self._state.cwd)
             except FileNotFoundError:
                 chunks.append(f"touch: cannot touch '{path}': No such file or directory\n")
             except NotADirectoryError:
                 chunks.append(f"touch: cannot touch '{path}': Not a directory\n")
+        return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
+
+    def _cmd_chmod(self, args: list[str]) -> CommandResult:
+        if not args:
+            return _fail(
+                "chmod: missing operand\nTry 'chmod --help' for more information."
+            )
+        mode = args[0]
+        paths = args[1:]
+        if not paths:
+            return _fail(
+                f"chmod: missing operand after '{mode}'\n"
+                "Try 'chmod --help' for more information."
+            )
+        chunks: list[str] = []
+        for path in paths:
+            try:
+                self._vfs.chmod(path, mode, self._state.cwd)
+            except FileNotFoundError:
+                chunks.append(
+                    f"chmod: cannot access '{path}': No such file or directory\n"
+                )
+            except NotADirectoryError:
+                chunks.append(f"chmod: cannot access '{path}': Not a directory\n")
+            except ValueError:
+                return _fail(
+                    f"chmod: invalid mode: '{mode}'\n"
+                    "Try 'chmod --help' for more information."
+                )
         return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_wget(self, args: list[str]) -> CommandResult:

@@ -5,6 +5,7 @@ All nodes live in process memory. Path resolution never touches the host disk.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Final
@@ -320,6 +321,69 @@ def build_honeypot_tree() -> VFSDirectory:
     )
 
 
+def apply_chmod_mode(current: int, spec: str) -> int:
+    """Return permission bits after applying octal or symbolic ``spec``."""
+    stripped = spec.strip()
+    if not stripped:
+        raise ValueError(spec)
+    if all(char in "01234567" for char in stripped):
+        if len(stripped) > 4:
+            raise ValueError(spec)
+        return int(stripped, 8) & 0o7777
+    result = current & 0o7777
+    for clause in stripped.split(","):
+        result = _apply_symbolic_clause(result, clause)
+    return result
+
+
+def _apply_symbolic_clause(current: int, clause: str) -> int:
+    if not clause:
+        raise ValueError(clause)
+    index = 0
+    who_chars: list[str] = []
+    while index < len(clause) and clause[index] in "ugoa":
+        who_chars.append(clause[index])
+        index += 1
+    if index >= len(clause) or clause[index] not in "+-=":
+        raise ValueError(clause)
+    op = clause[index]
+    perms = clause[index + 1 :]
+    if any(char not in "rwxst" for char in perms):
+        raise ValueError(clause)
+    subjects = {"u", "g", "o"} if (not who_chars or "a" in who_chars) else set(who_chars)
+    bit_map = {
+        ("u", "r"): 0o400,
+        ("u", "w"): 0o200,
+        ("u", "x"): 0o100,
+        ("u", "s"): 0o4000,
+        ("g", "r"): 0o040,
+        ("g", "w"): 0o020,
+        ("g", "x"): 0o010,
+        ("g", "s"): 0o2000,
+        ("o", "r"): 0o004,
+        ("o", "w"): 0o002,
+        ("o", "x"): 0o001,
+        ("o", "t"): 0o1000,
+    }
+    delta = 0
+    for subject in subjects:
+        for perm in perms:
+            key = ("o", "t") if perm == "t" else (subject, perm)
+            delta |= bit_map.get(key, 0)
+    who_mask = 0
+    if "u" in subjects:
+        who_mask |= 0o4700
+    if "g" in subjects:
+        who_mask |= 0o2070
+    if "o" in subjects:
+        who_mask |= 0o1007
+    if op == "+":
+        return current | delta
+    if op == "-":
+        return current & ~delta
+    return (current & ~who_mask) | delta
+
+
 def create_default_vfs() -> VirtualFileSystem:
     """Return an isolated default honeypot tree (no shared inode references)."""
     return VirtualFileSystem()
@@ -336,6 +400,10 @@ class VirtualFileSystem:
     ) -> None:
         self._root = root if root is not None else build_honeypot_tree()
         self.home = home
+
+    def clone(self) -> VirtualFileSystem:
+        """Deep-copy this tree so mutations never leak across sessions."""
+        return VirtualFileSystem(deepcopy(self._root), home=self.home)
 
     def resolve(self, path: str, cwd: str) -> INode:
         """Return the inode at ``path``, raising POSIX-style errors on failure."""
@@ -383,18 +451,25 @@ class VirtualFileSystem:
     def get(self, path: str, cwd: str) -> INode:
         return self.resolve(path, cwd)
 
-    def touch_file(self, path: str, cwd: str) -> None:
-        """Create an empty file if missing. Existing files and directories are left as-is."""
+    def touch(self, path: str, cwd: str) -> None:
+        """Create an empty file if missing; update mtime when the node exists."""
         abs_path = canonicalize(path, cwd, self.home)
         if abs_path == "/":
+            self._root.mtime = datetime.now(timezone.utc)
             return
         directory = self.resolve(parent_path(abs_path), "/")
         if not isinstance(directory, VFSDirectory):
             raise NotADirectoryError(parent_path(abs_path))
         name = abs_path.rsplit("/", 1)[-1]
         existing = directory.children.get(name)
+        now = datetime.now(timezone.utc)
         if existing is None:
-            directory.children[name] = VFSFile(name=name, content="", mode=0o644)
+            directory.children[name] = VFSFile(name=name, content="", mode=0o644, mtime=now)
+            return
+        existing.mtime = now
+
+    def touch_file(self, path: str, cwd: str) -> None:
+        self.touch(path, cwd)
 
     def write_file(self, path: str, content: str, cwd: str, append: bool = False) -> None:
         abs_path = canonicalize(path, cwd, self.home)
@@ -417,11 +492,11 @@ class VirtualFileSystem:
             return
         directory.children[name] = VFSFile(name=name, content=content, mode=0o644, mtime=now)
 
-    def mkdir(self, path: str, cwd: str, parents: bool = False, mode: int = 0o755) -> None:
+    def mkdir(self, path: str, cwd: str, parents: bool = False, mode: int = 0o755) -> bool:
         abs_path = canonicalize(path, cwd, self.home)
         if abs_path == "/":
             if parents:
-                return
+                return True
             raise FileExistsError("/")
         now = datetime.now(timezone.utc)
         if parents:
@@ -438,8 +513,8 @@ class VirtualFileSystem:
                     continue
                 node = child
             if not isinstance(node, VFSDirectory):
-                raise NotADirectoryError(abs_path)
-            return
+                raise FileExistsError(abs_path)
+            return True
         parent = parent_path(abs_path)
         try:
             directory = self.resolve(parent, "/")
@@ -451,8 +526,39 @@ class VirtualFileSystem:
         if name in directory.children:
             raise FileExistsError(abs_path)
         directory.children[name] = VFSDirectory(name=name, mode=mode, mtime=now)
+        return True
 
-    def remove(self, path: str, cwd: str, recursive: bool = False) -> None:
+    def remove(
+        self,
+        path: str,
+        cwd: str,
+        recursive: bool = False,
+        force: bool = False,
+    ) -> bool:
+        abs_path = canonicalize(path, cwd, self.home)
+        if abs_path == "/":
+            raise OSError("Directory not empty")
+        parent = parent_path(abs_path)
+        try:
+            directory = self.resolve(parent, "/")
+        except FileNotFoundError:
+            if force:
+                return True
+            raise
+        if not isinstance(directory, VFSDirectory):
+            raise NotADirectoryError(parent)
+        name = abs_path.rsplit("/", 1)[-1]
+        node = directory.children.get(name)
+        if node is None:
+            if force:
+                return True
+            raise FileNotFoundError(abs_path)
+        if isinstance(node, VFSDirectory) and not recursive:
+            raise IsADirectoryError(abs_path)
+        del directory.children[name]
+        return True
+
+    def rmdir(self, path: str, cwd: str) -> None:
         abs_path = canonicalize(path, cwd, self.home)
         if abs_path == "/":
             raise OSError("Directory not empty")
@@ -464,6 +570,12 @@ class VirtualFileSystem:
         node = directory.children.get(name)
         if node is None:
             raise FileNotFoundError(abs_path)
-        if isinstance(node, VFSDirectory) and node.children and not recursive:
+        if not isinstance(node, VFSDirectory):
+            raise NotADirectoryError(abs_path)
+        if node.children:
             raise OSError("Directory not empty")
         del directory.children[name]
+
+    def chmod(self, path: str, mode: str, cwd: str) -> None:
+        node = self.resolve(path, cwd)
+        node.mode = apply_chmod_mode(node.mode, mode)

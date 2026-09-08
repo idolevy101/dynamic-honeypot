@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,6 +19,7 @@ from vfs import (
     VFSFile,
     VirtualFileSystem,
     canonicalize,
+    create_default_vfs,
 )
 
 
@@ -259,6 +261,9 @@ async def test_local_commands_do_not_call_llm(vfs: VirtualFileSystem) -> None:
     await shell.execute("cd /tmp")
     await shell.execute("cat /etc/hostname")
     await shell.execute("touch /tmp/keep")
+    await shell.execute("mkdir /tmp/keepdir")
+    await shell.execute("chmod +x /tmp/keep")
+    await shell.execute("rm /tmp/keep")
     assert provider.calls == []
 
 
@@ -603,3 +608,207 @@ async def test_network_and_firewall_static_variants(shell: Shell) -> None:
     dmidecode = await shell.execute("dmidecode -s system-product-name")
     assert dmidecode.execution_path == "static"
     assert dmidecode.output == "Standard PC (Q35 + ICH9, 2009)"
+
+
+def test_vfs_clone_and_default_instances_are_isolated() -> None:
+    base = create_default_vfs()
+    first = base.clone()
+    second = create_default_vfs()
+    first.touch("/tmp/isolated.txt", "/")
+    first.mkdir("/tmp/isolated-dir", "/")
+    assert first.exists("/tmp/isolated.txt", "/")
+    assert first.exists("/tmp/isolated-dir", "/")
+    assert not second.exists("/tmp/isolated.txt", "/")
+    assert not second.exists("/tmp/isolated-dir", "/")
+    assert not base.exists("/tmp/isolated.txt", "/")
+
+
+def test_vfs_chmod_octal_and_symbolic(vfs: VirtualFileSystem) -> None:
+    vfs.touch("/tmp/script.sh", "/")
+    node = vfs.get("/tmp/script.sh", "/")
+    assert node.mode == 0o644
+    vfs.chmod("/tmp/script.sh", "+x", "/")
+    assert node.mode == 0o755
+    vfs.chmod("/tmp/script.sh", "777", "/")
+    assert node.mode == 0o777
+    vfs.chmod("/tmp/script.sh", "-x", "/")
+    assert node.mode == 0o666
+    vfs.chmod("/tmp/script.sh", "644", "/")
+    assert node.mode == 0o644
+
+
+def test_vfs_remove_force_and_directory_guard(vfs: VirtualFileSystem) -> None:
+    vfs.mkdir("/tmp/keep", "/")
+    assert vfs.remove("/tmp/missing", "/", force=True) is True
+    with pytest.raises(IsADirectoryError):
+        vfs.remove("/tmp/keep", "/")
+    assert vfs.remove("/tmp/keep", "/", recursive=True) is True
+    assert not vfs.exists("/tmp/keep", "/")
+
+
+async def test_mkdir_p_nested_existing_and_errors(shell: Shell) -> None:
+    created = await shell.execute("mkdir /tmp/payloads")
+    assert created.output == ""
+    assert created.exit_code == 0
+
+    exists = await shell.execute("mkdir /tmp/payloads")
+    assert exists.output == "mkdir: cannot create directory '/tmp/payloads': File exists\n"
+    assert exists.exit_code == 1
+    status = await shell.execute("echo $?")
+    assert status.output == "1\n"
+
+    missing_parent = await shell.execute("mkdir /tmp/missing/nested")
+    assert missing_parent.output == (
+        "mkdir: cannot create directory '/tmp/missing/nested': No such file or directory\n"
+    )
+    assert missing_parent.exit_code == 1
+
+    nested = await shell.execute("mkdir -p /tmp/a/b/c/d")
+    assert nested.output == ""
+    assert nested.exit_code == 0
+    listing = await shell.execute("ls /tmp/a/b/c")
+    assert "d" in listing.output.split("  ")
+
+    long_opt = await shell.execute("mkdir --parents /tmp/a/b/c/d")
+    assert long_opt.output == ""
+    assert long_opt.exit_code == 0
+
+    idempotent = await shell.execute("mkdir -p /tmp/payloads")
+    assert idempotent.output == ""
+    assert idempotent.exit_code == 0
+
+    multi = await shell.execute("mkdir /tmp/one /tmp/two")
+    assert multi.output == ""
+    assert multi.exit_code == 0
+    root_tmp = await shell.execute("ls /tmp")
+    names = root_tmp.output.split("  ")
+    assert "one" in names
+    assert "two" in names
+
+
+async def test_created_paths_are_navigable_and_listed(shell: Shell) -> None:
+    await shell.execute("mkdir -p /tmp/work/bin")
+    cd = await shell.execute("cd /tmp/work")
+    assert cd.exit_code == 0
+    assert shell.state.cwd == "/tmp/work"
+
+    touched = await shell.execute("touch rel.txt")
+    assert touched.output == ""
+    assert touched.exit_code == 0
+
+    listing = await shell.execute("ls")
+    assert "bin" in listing.output.split("  ")
+    assert "rel.txt" in listing.output.split("  ")
+
+    long_listing = await shell.execute("ls -la")
+    lines = long_listing.output.splitlines()
+    names = [line.rsplit(" ", 1)[-1] for line in lines[1:]]
+    assert "bin" in names
+    assert "rel.txt" in names
+    bin_line = next(line for line in lines[1:] if line.endswith(" bin"))
+    assert bin_line.startswith("drwxr-xr-x")
+    file_line = next(line for line in lines[1:] if line.endswith(" rel.txt"))
+    assert file_line.startswith("-rw-r--r--")
+
+    abs_touch = await shell.execute("touch /tmp/work/abs.txt")
+    assert abs_touch.exit_code == 0
+    assert "abs.txt" in (await shell.execute("ls /tmp/work")).output.split("  ")
+
+
+async def test_touch_multi_arg_and_invalid_parent(shell: Shell) -> None:
+    ok = await shell.execute("touch /tmp/alpha /tmp/beta /tmp/gamma")
+    assert ok.output == ""
+    assert ok.exit_code == 0
+    listing = await shell.execute("ls /tmp")
+    names = listing.output.split("  ")
+    assert "alpha" in names
+    assert "beta" in names
+    assert "gamma" in names
+
+    missing = await shell.execute("touch /no/such/file")
+    assert missing.output == "touch: cannot touch '/no/such/file': No such file or directory\n"
+    assert missing.exit_code == 1
+    status = await shell.execute("echo $?")
+    assert status.output == "1\n"
+
+
+async def test_rm_multi_arg_directory_and_force(shell: Shell) -> None:
+    await shell.execute("touch /tmp/file1 /tmp/file2 /tmp/file3")
+    await shell.execute("mkdir /tmp/stash")
+
+    is_dir = await shell.execute("rm /tmp/stash")
+    assert is_dir.output == "rm: cannot remove '/tmp/stash': Is a directory\n"
+    assert is_dir.exit_code == 1
+    assert "stash" in (await shell.execute("ls /tmp")).output.split("  ")
+
+    missing = await shell.execute("rm /tmp/nope.txt")
+    assert missing.output == "rm: cannot remove '/tmp/nope.txt': No such file or directory\n"
+    assert missing.exit_code == 1
+
+    forced = await shell.execute("rm -f /tmp/nope.txt")
+    assert forced.output == ""
+    assert forced.exit_code == 0
+
+    multi = await shell.execute("rm /tmp/file1 /tmp/file2")
+    assert multi.output == ""
+    assert multi.exit_code == 0
+    leftover = (await shell.execute("ls /tmp")).output.split("  ")
+    assert "file1" not in leftover
+    assert "file2" not in leftover
+    assert "file3" in leftover
+
+    grouped = await shell.execute("rm -rf /tmp/stash /tmp/file3")
+    assert grouped.output == ""
+    assert grouped.exit_code == 0
+    after = (await shell.execute("ls /tmp")).output.split("  ")
+    assert "stash" not in after
+    assert "file3" not in after
+
+    fr = await shell.execute("rm -fr /tmp/still-missing")
+    assert fr.output == ""
+    assert fr.exit_code == 0
+    status = await shell.execute("echo $?")
+    assert status.output == "0\n"
+
+
+async def test_chmod_updates_ls_permissions_and_errors(shell: Shell) -> None:
+    await shell.execute("touch /tmp/script.sh /tmp/other.sh")
+    before = await shell.execute("ls -l /tmp/script.sh")
+    assert before.output.startswith("-rw-r--r--")
+    assert before.exit_code == 0
+
+    plus_x = await shell.execute("chmod +x /tmp/script.sh")
+    assert plus_x.output == ""
+    assert plus_x.exit_code == 0
+    after_x = await shell.execute("ls -l /tmp/script.sh")
+    assert after_x.output.startswith("-rwxr-xr-x")
+
+    mode_777 = await shell.execute("chmod 777 /tmp/script.sh /tmp/other.sh")
+    assert mode_777.output == ""
+    assert mode_777.exit_code == 0
+    both = await shell.execute("ls -l /tmp/script.sh")
+    assert both.output.startswith("-rwxrwxrwx")
+    other = await shell.execute("ls -l /tmp/other.sh")
+    assert other.output.startswith("-rwxrwxrwx")
+
+    missing = await shell.execute("chmod 755 /tmp/missing.sh")
+    assert missing.output == (
+        "chmod: cannot access '/tmp/missing.sh': No such file or directory\n"
+    )
+    assert missing.exit_code == 1
+    status = await shell.execute("echo $?")
+    assert status.output == "1\n"
+
+
+async def test_file_mutations_do_not_touch_host_filesystem(
+    shell: Shell, tmp_path: Path
+) -> None:
+    marker = "vfs_isolation_marker_9f3c"
+    host_tmp = Path("/tmp") / marker
+    await shell.execute(f"mkdir /tmp/{marker}")
+    await shell.execute(f"touch /tmp/{marker}/file")
+    await shell.execute(f"chmod 777 /tmp/{marker}/file")
+    listing = await shell.execute(f"ls /tmp/{marker}")
+    assert "file" in listing.output.split("  ")
+    assert not (tmp_path / marker).exists()
+    assert not host_tmp.exists()
