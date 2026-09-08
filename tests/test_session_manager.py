@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
+from auth import AuthManager
 from llm import NullLLMProvider
+from server import _periodic_sweep
 from session_manager import SessionManager
 from shell import Shell
 from vfs import create_default_vfs
@@ -113,3 +117,21 @@ async def test_shared_llm_cache_survives_reconnect() -> None:
     second_out = await second.execute("lscpu")
     assert first_out.output == second_out.output
     provider.generate_response.assert_called_once()
+
+
+async def test_periodic_sweep_clears_idle_session_and_pin() -> None:
+    now = 10.0
+    sessions = SessionManager(max_sessions=8, ttl_seconds=1, clock=lambda: now)
+    auth = AuthManager(tarpit_seconds=0.0, ttl_seconds=1, clock=lambda: now)
+    sessions.get_or_create("10.0.0.1")
+    auth.get_or_pin_password("10.0.0.1")
+    now = 20.0
+    task = asyncio.create_task(_periodic_sweep(sessions, auth, interval=0.01))
+    try:
+        await asyncio.sleep(0.05)
+        assert "10.0.0.1" not in sessions
+        assert "10.0.0.1" not in auth
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

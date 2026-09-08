@@ -6,12 +6,17 @@ Host OS execution is never used.
 
 from __future__ import annotations
 
+import hashlib
 import shlex
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Sequence
+from urllib.parse import urlparse
 
 from llm import LLMProvider, NullLLMProvider
+from sinkhole import filename_from_url, mocked_payload, quarantine_artifact
+from telemetry import record_command
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
@@ -110,6 +115,186 @@ def _parse_redirection(tokens: Sequence[str]) -> tuple[list[str], str | None, bo
     return command, redirect_path, append
 
 
+@dataclass(frozen=True)
+class _ChainSegment:
+    command: str
+    operator: str
+
+
+def split_command_chain(line: str) -> list[_ChainSegment]:
+    """Split ``;``, ``&&``, and ``||`` outside quotes. Pipes are left intact."""
+    segments: list[_ChainSegment] = []
+    buf: list[str] = []
+    quote: str | None = None
+    incoming = ""
+    index = 0
+    length = len(line)
+    while index < length:
+        char = line[index]
+        if quote is None and char == "\\":
+            buf.append(char)
+            if index + 1 < length:
+                buf.append(line[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            buf.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+            buf.append(char)
+            index += 1
+            continue
+        if char == ";":
+            command = "".join(buf).strip()
+            if command:
+                segments.append(_ChainSegment(command, incoming))
+                incoming = ";"
+            buf = []
+            index += 1
+            continue
+        if char == "&" and index + 1 < length and line[index + 1] == "&":
+            command = "".join(buf).strip()
+            if command:
+                segments.append(_ChainSegment(command, incoming))
+                incoming = "&&"
+            buf = []
+            index += 2
+            continue
+        if char == "|" and index + 1 < length and line[index + 1] == "|":
+            command = "".join(buf).strip()
+            if command:
+                segments.append(_ChainSegment(command, incoming))
+                incoming = "||"
+            buf = []
+            index += 2
+            continue
+        buf.append(char)
+        index += 1
+    command = "".join(buf).strip()
+    if command:
+        segments.append(_ChainSegment(command, incoming))
+    return segments
+
+
+@dataclass(frozen=True)
+class _CurlArgs:
+    url: str | None
+    output_path: str | None
+    remote_name: bool
+    silent: bool
+
+
+def _parse_wget_args(args: Sequence[str]) -> tuple[str | None, str | None]:
+    output_path: str | None = None
+    url: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-O", "--output-document"):
+            if index + 1 < len(args):
+                output_path = args[index + 1]
+                index += 2
+                continue
+            index += 1
+            continue
+        if arg.startswith("--output-document="):
+            output_path = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            index += 1
+            continue
+        if url is None:
+            url = arg
+        index += 1
+    return url, output_path
+
+
+def _parse_curl_args(args: Sequence[str]) -> _CurlArgs:
+    output_path: str | None = None
+    remote_name = False
+    silent = False
+    url: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("-s", "--silent", "-sS"):
+            silent = True
+            index += 1
+            continue
+        if arg in ("-O", "--remote-name"):
+            remote_name = True
+            index += 1
+            continue
+        if arg in ("-o", "--output"):
+            if index + 1 < len(args):
+                output_path = args[index + 1]
+                index += 2
+                continue
+            index += 1
+            continue
+        if arg.startswith("--output="):
+            output_path = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg.startswith("-o") and arg != "-o":
+            output_path = arg[2:]
+            index += 1
+            continue
+        if arg.startswith("-") and arg != "-":
+            flags = arg[1:]
+            if "s" in flags:
+                silent = True
+            if "O" in flags:
+                remote_name = True
+            index += 1
+            continue
+        if url is None:
+            url = arg
+        index += 1
+    return _CurlArgs(url=url, output_path=output_path, remote_name=remote_name, silent=silent)
+
+
+def _fake_ipv4(host: str) -> str:
+    digest = hashlib.sha256(host.encode("utf-8")).digest()
+    return f"{1 + digest[0] % 223}.{digest[1]}.{digest[2]}.{1 + digest[3] % 254}"
+
+
+def _wget_progress(url: str, filename: str, size: int) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    host = urlparse(url).hostname or url
+    ip = _fake_ipv4(host)
+    scheme = urlparse(url).scheme or "http"
+    port = urlparse(url).port or (443 if scheme == "https" else 80)
+    return (
+        f"--{now}--  {url}\n"
+        f"Resolving {host} ({host})... {ip}\n"
+        f"Connecting to {host} ({host})|{ip}|:{port}... connected.\n"
+        "HTTP request sent, awaiting response... 200 OK\n"
+        f"Length: {size} [application/octet-stream]\n"
+        f"Saving to: ‘{filename}’\n"
+        "\n"
+        f"{filename:<20} 100%[===================>] {size:>7}  --.-KB/s    in 0s\n"
+        "\n"
+        f"{now} (12.4 MB/s) - ‘{filename}’ saved [{size}/{size}]"
+    )
+
+
+def _curl_progress(size: int) -> str:
+    speed = max(size, 1)
+    return (
+        "  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current\n"
+        "                                 Dload  Upload   Total   Spent    Left  Speed\n"
+        f"100  {size:4d}  100  {size:4d}    0     0  {speed:5d}      0 --:--:-- --:--:-- --:--:-- {speed:5d}"
+    )
+
+
 def lookup_static_output(tokens: Sequence[str]) -> str | None:
     """Return a pre-LLM recon template, or None to fall through to the provider."""
     if not tokens:
@@ -134,6 +319,15 @@ class SessionState:
 class CommandResult:
     output: str = ""
     exit_session: bool = False
+    exit_code: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0
+
+
+def _fail(output: str, *, exit_code: int = 1) -> CommandResult:
+    return CommandResult(output=output, exit_code=exit_code)
 
 
 class Shell:
@@ -145,11 +339,17 @@ class Shell:
         state: SessionState | None = None,
         llm_provider: LLMProvider | None = None,
         llm_cache: dict[str, str] | None = None,
+        *,
+        session_id: str = "local",
+        client_ip: str = "unknown",
     ) -> None:
         self._vfs = vfs
         self._state = state if state is not None else SessionState(home=vfs.home)
         self._llm_provider = llm_provider if llm_provider is not None else NullLLMProvider()
         self._llm_cache: dict[str, str] = llm_cache if llm_cache is not None else {}
+        self._session_id = session_id
+        self._client_ip = client_ip
+        self._captured_artifacts: list[str] = []
         self._handlers = {
             "pwd": self._cmd_pwd,
             "cd": self._cmd_cd,
@@ -160,6 +360,8 @@ class Shell:
             "mkdir": self._cmd_mkdir,
             "rm": self._cmd_rm,
             "rmdir": self._cmd_rmdir,
+            "wget": self._cmd_wget,
+            "curl": self._cmd_curl,
             "exit": self._cmd_exit,
             "logout": self._cmd_exit,
         }
@@ -177,43 +379,132 @@ class Shell:
         stripped = line.strip()
         if not stripped:
             return CommandResult()
-        try:
-            tokens = shlex.split(line, posix=True)
-        except ValueError as exc:
-            return CommandResult(f"bash: {exc}")
-        if not tokens:
-            return CommandResult()
-        try:
-            command_tokens, redirect_path, append = _parse_redirection(tokens)
-        except ValueError as exc:
-            return CommandResult(str(exc))
-        if not command_tokens:
-            return CommandResult()
-        dispatch_line = stripped if redirect_path is None else " ".join(command_tokens)
-        result = await self._dispatch(command_tokens, dispatch_line)
-        if redirect_path is None:
-            return result
-        try:
-            self._vfs.write_file(redirect_path, result.output, self._state.cwd, append=append)
-        except FileNotFoundError:
-            return CommandResult(f"bash: {redirect_path}: No such file or directory")
-        except IsADirectoryError:
-            return CommandResult(f"bash: {redirect_path}: Is a directory")
-        except NotADirectoryError:
-            return CommandResult(f"bash: {redirect_path}: Not a directory")
-        return CommandResult(exit_session=result.exit_session)
+        segments = split_command_chain(stripped)
+        if len(segments) <= 1:
+            command = segments[0].command if segments else stripped
+            return await self._execute_simple(command)
+        return await self._execute_chain(segments)
 
-    async def _dispatch(self, tokens: list[str], stripped: str) -> CommandResult:
+    async def _execute_chain(self, segments: list[_ChainSegment]) -> CommandResult:
+        outputs: list[str] = []
+        last = CommandResult()
+        last_ok = True
+        for segment in segments:
+            if segment.operator == "&&" and not last_ok:
+                continue
+            if segment.operator == "||" and last_ok:
+                continue
+            last = await self._execute_simple(segment.command)
+            last_ok = last.ok
+            if last.output:
+                outputs.append(last.output)
+            if last.exit_session:
+                break
+        return CommandResult(
+            output="".join(outputs),
+            exit_session=last.exit_session,
+            exit_code=last.exit_code,
+        )
+
+    async def _execute_simple(self, line: str) -> CommandResult:
+        stripped = line.strip()
+        if not stripped:
+            return CommandResult()
+        started = time.perf_counter()
+        self._captured_artifacts = []
+        execution_path = "vfs"
+        result = CommandResult()
+        try:
+            try:
+                tokens = shlex.split(line, posix=True)
+            except ValueError as exc:
+                result = _fail(f"bash: {exc}", exit_code=2)
+            else:
+                if not tokens:
+                    result = CommandResult()
+                else:
+                    try:
+                        command_tokens, redirect_path, append = _parse_redirection(tokens)
+                    except ValueError as exc:
+                        result = _fail(str(exc), exit_code=2)
+                    else:
+                        if not command_tokens:
+                            result = CommandResult()
+                        else:
+                            dispatch_line = (
+                                stripped if redirect_path is None else " ".join(command_tokens)
+                            )
+                            result, execution_path = await self._dispatch(
+                                command_tokens, dispatch_line
+                            )
+                            if redirect_path is not None:
+                                result = self._apply_redirection(
+                                    result, redirect_path, append
+                                )
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            await record_command(
+                session_id=self._session_id,
+                client_ip=self._client_ip,
+                command=stripped,
+                execution_path=execution_path,
+                duration_ms=duration_ms,
+                captured_artifacts=self._captured_artifacts,
+            )
+        return result
+
+    def _apply_redirection(
+        self,
+        result: CommandResult,
+        redirect_path: str,
+        append: bool,
+    ) -> CommandResult:
+        try:
+            self._vfs.write_file(
+                redirect_path, result.output, self._state.cwd, append=append
+            )
+        except FileNotFoundError:
+            return _fail(f"bash: {redirect_path}: No such file or directory")
+        except IsADirectoryError:
+            return _fail(f"bash: {redirect_path}: Is a directory")
+        except NotADirectoryError:
+            return _fail(f"bash: {redirect_path}: Not a directory")
+        name = redirect_path.rstrip("/").rsplit("/", 1)[-1] or redirect_path
+        self._quarantine(name, result.output)
+        return CommandResult(exit_session=result.exit_session, exit_code=result.exit_code)
+
+    def _quarantine(
+        self,
+        filename: str,
+        content: str,
+        source_url: str = "",
+    ) -> None:
+        try:
+            meta = quarantine_artifact(
+                filename, content, self._client_ip, source_url
+            )
+        except OSError:
+            return
+        sha256 = meta.get("sha256")
+        if isinstance(sha256, str) and sha256:
+            self._captured_artifacts.append(sha256)
+
+    async def _dispatch(
+        self, tokens: list[str], stripped: str
+    ) -> tuple[CommandResult, str]:
         command, *args = tokens
         handler = self._handlers.get(command)
         if handler is not None:
-            return handler(args)
+            path = "sinkhole" if command in {"wget", "curl"} else "vfs"
+            return handler(args), path
         static = lookup_static_output(tokens)
         if static is not None:
-            return CommandResult(static)
+            return CommandResult(static), "static"
         cacheable = _is_cacheable_llm_command(tokens)
         if cacheable and stripped in self._llm_cache:
-            return CommandResult(self._llm_cache[stripped])
+            output = self._llm_cache[stripped]
+            exit_code = 127 if "command not found" in output else 0
+            return CommandResult(output, exit_code=exit_code), "cache"
         output = await self._llm_provider.generate_response(
             stripped,
             self._state.cwd,
@@ -221,7 +512,8 @@ class Shell:
         )
         if cacheable:
             self._llm_cache[stripped] = output
-        return CommandResult(output)
+        exit_code = 127 if "command not found" in output else 0
+        return CommandResult(output, exit_code=exit_code), "llm"
 
     def _llm_context(self) -> dict[str, Any]:
         try:
@@ -239,10 +531,10 @@ class Shell:
 
     def _cmd_cd(self, args: list[str]) -> CommandResult:
         if len(args) > 1:
-            return CommandResult("bash: cd: too many arguments")
+            return _fail("bash: cd: too many arguments")
         if args and args[0] == "-":
             if self._state.oldpwd is None:
-                return CommandResult("bash: cd: OLDPWD not set")
+                return _fail("bash: cd: OLDPWD not set")
             raw = self._state.oldpwd
             target = self._state.oldpwd
             announce = True
@@ -253,11 +545,11 @@ class Shell:
         try:
             node = self._vfs.resolve(target, self._state.cwd)
         except FileNotFoundError:
-            return CommandResult(f"bash: cd: {raw}: No such file or directory")
+            return _fail(f"bash: cd: {raw}: No such file or directory")
         except NotADirectoryError:
-            return CommandResult(f"bash: cd: {raw}: Not a directory")
+            return _fail(f"bash: cd: {raw}: Not a directory")
         if not isinstance(node, VFSDirectory):
-            return CommandResult(f"bash: cd: {raw}: Not a directory")
+            return _fail(f"bash: cd: {raw}: Not a directory")
         self._state.oldpwd = self._state.cwd
         self._state.cwd = target
         return CommandResult(target if announce else "")
@@ -280,10 +572,10 @@ class Shell:
             node = self._vfs.resolve(target, self._state.cwd)
         except FileNotFoundError:
             shown = paths[0] if paths else target
-            return CommandResult(f"ls: cannot access '{shown}': No such file or directory")
+            return _fail(f"ls: cannot access '{shown}': No such file or directory")
         except NotADirectoryError:
             shown = paths[0] if paths else target
-            return CommandResult(f"ls: cannot access '{shown}': Not a directory")
+            return _fail(f"ls: cannot access '{shown}': Not a directory")
         if isinstance(node, VFSDirectory):
             abs_path = canonicalize(target, self._state.cwd, self._state.home)
             return CommandResult(self._format_ls_dir(node, abs_path, long_fmt, show_all))
@@ -291,20 +583,24 @@ class Shell:
 
     def _cmd_cat(self, args: list[str]) -> CommandResult:
         if not args:
-            return CommandResult(
+            return _fail(
                 "cat: missing file operand\nTry 'cat --help' for more information."
             )
         chunks: list[str] = []
+        failed = False
         for path in args:
             try:
                 chunks.append(self._vfs.read_file(path, self._state.cwd))
             except FileNotFoundError:
+                failed = True
                 chunks.append(f"cat: {path}: No such file or directory\n")
             except IsADirectoryError:
+                failed = True
                 chunks.append(f"cat: {path}: Is a directory\n")
             except NotADirectoryError:
+                failed = True
                 chunks.append(f"cat: {path}: Not a directory\n")
-        return CommandResult("".join(chunks))
+        return CommandResult("".join(chunks), exit_code=1 if failed else 0)
 
     def _cmd_echo(self, args: list[str]) -> CommandResult:
         return CommandResult(" ".join(args) + "\n")
@@ -319,7 +615,7 @@ class Shell:
                 continue
             paths.append(arg)
         if not paths:
-            return CommandResult(
+            return _fail(
                 "mkdir: missing operand\nTry 'mkdir --help' for more information."
             )
         chunks: list[str] = []
@@ -334,7 +630,7 @@ class Shell:
                 )
             except NotADirectoryError:
                 chunks.append(f"mkdir: cannot create directory '{path}': Not a directory\n")
-        return CommandResult("".join(chunks))
+        return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_rm(self, args: list[str]) -> CommandResult:
         recursive = False
@@ -350,7 +646,7 @@ class Shell:
                 continue
             paths.append(arg)
         if not paths:
-            return CommandResult(
+            return _fail(
                 "rm: missing operand\nTry 'rm --help' for more information."
             )
         chunks: list[str] = []
@@ -369,7 +665,7 @@ class Shell:
                 chunks.append(f"rm: cannot remove '{path}': Directory not empty\n")
             except NotADirectoryError:
                 chunks.append(f"rm: cannot remove '{path}': Not a directory\n")
-        return CommandResult("".join(chunks))
+        return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_rmdir(self, args: list[str]) -> CommandResult:
         paths: list[str] = []
@@ -378,7 +674,7 @@ class Shell:
                 continue
             paths.append(arg)
         if not paths:
-            return CommandResult(
+            return _fail(
                 "rmdir: missing operand\nTry 'rmdir --help' for more information."
             )
         chunks: list[str] = []
@@ -398,11 +694,11 @@ class Shell:
                 chunks.append(f"rmdir: failed to remove '{path}': Directory not empty\n")
             except NotADirectoryError:
                 chunks.append(f"rmdir: failed to remove '{path}': Not a directory\n")
-        return CommandResult("".join(chunks))
+        return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
 
     def _cmd_touch(self, args: list[str]) -> CommandResult:
         if not args:
-            return CommandResult(
+            return _fail(
                 "touch: missing file operand\nTry 'touch --help' for more information."
             )
         chunks: list[str] = []
@@ -413,7 +709,57 @@ class Shell:
                 chunks.append(f"touch: cannot touch '{path}': No such file or directory\n")
             except NotADirectoryError:
                 chunks.append(f"touch: cannot touch '{path}': Not a directory\n")
-        return CommandResult("".join(chunks))
+        return CommandResult("".join(chunks), exit_code=1 if chunks else 0)
+
+    def _cmd_wget(self, args: list[str]) -> CommandResult:
+        url, output_path = _parse_wget_args(args)
+        if url is None:
+            return _fail(
+                "wget: missing URL\nUsage: wget [OPTION]... [URL]...\n"
+            )
+        target = output_path if output_path is not None else filename_from_url(url)
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = mocked_payload(url, self._client_ip, timestamp)
+        try:
+            self._vfs.write_file(target, payload, self._state.cwd)
+        except FileNotFoundError:
+            return _fail(f"wget: {target}: No such file or directory")
+        except IsADirectoryError:
+            return _fail(f"wget: {target}: Is a directory")
+        except NotADirectoryError:
+            return _fail(f"wget: {target}: Not a directory")
+        name = target.rstrip("/").rsplit("/", 1)[-1] or filename_from_url(url)
+        self._quarantine(name, payload, source_url=url)
+        return CommandResult(_wget_progress(url, name, len(payload.encode("utf-8"))))
+
+    def _cmd_curl(self, args: list[str]) -> CommandResult:
+        parsed = _parse_curl_args(args)
+        if parsed.url is None:
+            return _fail("curl: no URL specified!")
+        url = parsed.url
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload = mocked_payload(url, self._client_ip, timestamp)
+        target = parsed.output_path
+        if target is None and parsed.remote_name:
+            target = filename_from_url(url)
+        if target is not None:
+            try:
+                self._vfs.write_file(target, payload, self._state.cwd)
+            except FileNotFoundError:
+                return _fail("curl: (23) Failure writing output to destination")
+            except IsADirectoryError:
+                return _fail("curl: (23) Failure writing output to destination")
+            except NotADirectoryError:
+                return _fail("curl: (23) Failure writing output to destination")
+            name = target.rstrip("/").rsplit("/", 1)[-1] or filename_from_url(url)
+            self._quarantine(name, payload, source_url=url)
+            if parsed.silent:
+                return CommandResult()
+            return CommandResult(_curl_progress(len(payload.encode("utf-8"))))
+        self._quarantine(filename_from_url(url), payload, source_url=url)
+        if parsed.silent:
+            return CommandResult(payload)
+        return CommandResult(payload)
 
     def _cmd_exit(self, _args: list[str]) -> CommandResult:
         return CommandResult(exit_session=True)

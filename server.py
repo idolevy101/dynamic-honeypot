@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -15,6 +16,7 @@ HOST = "127.0.0.1"
 PORT = 2222
 HOST_KEY_PATH = Path("./ssh_host_key")
 BANNER = "Welcome to Ubuntu 22.04 LTS (GNU/Linux 5.15.0-generic x86_64)"
+SWEEP_INTERVAL_SECONDS = 60.0
 
 _DISCONNECT_ERRORS = (
     asyncio.IncompleteReadError,
@@ -38,6 +40,20 @@ def _peer_ip(source: object) -> str:
     return "unknown"
 
 
+def _session_meta(process: asyncssh.SSHServerProcess[str]) -> tuple[str, str]:
+    try:
+        conn = process.channel.get_connection()
+    except (AssertionError, AttributeError, OSError):
+        return "local", _peer_ip(process)
+    session_id = conn.get_extra_info("honeypot_session_id", "local")
+    client_ip = conn.get_extra_info("honeypot_client_ip", None)
+    if not isinstance(session_id, str) or not session_id:
+        session_id = "local"
+    if not isinstance(client_ip, str) or not client_ip:
+        client_ip = _peer_ip(process)
+    return session_id, client_ip
+
+
 class HoneypotServer(asyncssh.SSHServer):
     def __init__(self, auth_manager: AuthManager, session_manager: SessionManager) -> None:
         self._auth = auth_manager
@@ -50,6 +66,10 @@ class HoneypotServer(asyncssh.SSHServer):
         self._conn = conn
         self._client_ip = _peer_ip(conn)
         self._session_id = self._auth.create_session(self._client_ip)
+        conn.set_extra_info(
+            honeypot_session_id=self._session_id,
+            honeypot_client_ip=self._client_ip,
+        )
 
     def connection_lost(self, exc: Exception | None) -> None:
         _ = exc
@@ -136,9 +156,15 @@ async def handle_client(
     llm_provider: LLMProvider,
     session_manager: SessionManager,
 ) -> None:
-    client_ip = _peer_ip(process)
+    session_id, client_ip = _session_meta(process)
     record = session_manager.get_or_create(client_ip)
-    shell = Shell(record.vfs, llm_provider=llm_provider, llm_cache=record.llm_cache)
+    shell = Shell(
+        record.vfs,
+        llm_provider=llm_provider,
+        llm_cache=record.llm_cache,
+        session_id=session_id,
+        client_ip=client_ip,
+    )
     try:
         process.stdout.write(f"{BANNER}\r\n")
         while True:
@@ -165,24 +191,45 @@ async def handle_client(
             pass
 
 
+async def _periodic_sweep(
+    session_manager: SessionManager,
+    auth_manager: AuthManager,
+    interval: float = SWEEP_INTERVAL_SECONDS,
+) -> None:
+    """Idle TTL cleanup that does not depend on incoming connections."""
+    while True:
+        await asyncio.sleep(interval)
+        session_manager.sweep()
+        auth_manager.sweep()
+
+
 async def main() -> None:
     load_dotenv()
     await ensure_host_key(HOST_KEY_PATH)
     auth_manager = AuthManager()
     session_manager = SessionManager()
     llm_provider = create_llm_provider()
-    await asyncssh.create_server(
-        make_server_factory(auth_manager, session_manager),
-        HOST,
-        PORT,
-        server_host_keys=[str(HOST_KEY_PATH)],
-        process_factory=partial(
-            handle_client,
-            llm_provider=llm_provider,
-            session_manager=session_manager,
-        ),
+    sweeper = asyncio.create_task(
+        _periodic_sweep(session_manager, auth_manager),
+        name="honeypot-session-sweep",
     )
-    await asyncio.Future()
+    try:
+        await asyncssh.create_server(
+            make_server_factory(auth_manager, session_manager),
+            HOST,
+            PORT,
+            server_host_keys=[str(HOST_KEY_PATH)],
+            process_factory=partial(
+                handle_client,
+                llm_provider=llm_provider,
+                session_manager=session_manager,
+            ),
+        )
+        await asyncio.Future()
+    finally:
+        sweeper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweeper
 
 
 if __name__ == "__main__":

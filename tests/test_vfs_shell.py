@@ -388,3 +388,37 @@ async def test_rm_and_rmdir_deletion_edge_cases(shell: Shell) -> None:
     assert recursive.output == ""
     missing_dir = await shell.execute("ls /tmp/tree")
     assert "No such file or directory" in missing_dir.output
+
+
+async def test_command_chaining_and_semicolon(shell: Shell) -> None:
+    result = await shell.execute(
+        'mkdir /tmp/test && touch /tmp/test/payload.sh; echo "done"'
+    )
+    assert "done" in result.output
+    assert result.exit_code == 0
+    listing = await shell.execute("ls /tmp/test")
+    assert "payload.sh" in listing.output.split("  ")
+    contents = await shell.execute("cat /tmp/test/payload.sh")
+    assert contents.output == ""
+
+
+async def test_and_chain_stops_on_failure(shell: Shell) -> None:
+    result = await shell.execute("mkdir /tmp/missing/nested && echo should-not")
+    assert "should-not" not in result.output
+    assert "No such file or directory" in result.output
+    assert result.exit_code != 0
+
+
+async def test_or_chain_runs_fallback(shell: Shell) -> None:
+    result = await shell.execute("cd /nope || cd /tmp")
+    assert shell.state.cwd == "/tmp"
+    assert "No such file" in result.output
+    assert result.exit_code == 0
+
+
+async def test_quoted_operator_is_not_a_chain(shell: Shell) -> None:
+    result = await shell.execute('echo "mkdir /tmp/x && touch f"')
+    assert result.output == "mkdir /tmp/x && touch f\n"
+    assert result.exit_code == 0
+    listing = await shell.execute("ls /tmp")
+    assert "x" not in listing.output.split("  ")
