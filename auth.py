@@ -23,6 +23,7 @@ DEFAULT_WEAK_PASSWORDS: tuple[str, ...] = (
     "ubuntu",
 )
 
+ALLOWED_USERNAME = "root"
 TARPIT_SECONDS = 2.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_PINS = 500
@@ -124,11 +125,14 @@ class AuthManager:
         username: str,
         password: str,
     ) -> bool:
-        pinned = self.get_or_pin_password(client_ip)
-        try:
-            success = secrets.compare_digest(str(password), str(pinned))
-        except (TypeError, ValueError):
+        if username != ALLOWED_USERNAME:
             success = False
+        else:
+            pinned = self.get_or_pin_password(client_ip)
+            try:
+                success = secrets.compare_digest(str(password), str(pinned))
+            except (TypeError, ValueError):
+                success = False
         with self._lock:
             now = self._clock()
             self._purge_expired_unlocked(now)

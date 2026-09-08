@@ -8,7 +8,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from auth import AuthAttemptLimitExceeded, AuthManager, DEFAULT_WEAK_PASSWORDS
+from auth import (
+    ALLOWED_USERNAME,
+    AuthAttemptLimitExceeded,
+    AuthManager,
+    DEFAULT_WEAK_PASSWORDS,
+)
 from server import HoneypotServer
 from session_manager import SessionManager
 
@@ -247,6 +252,55 @@ def test_auth_sweep_clears_expired_lockouts() -> None:
         assert "192.0.2.77" in auth
 
     asyncio.run(scenario())
+
+
+async def test_non_root_usernames_are_rejected_even_with_common_passwords() -> None:
+    auth = AuthManager(passwords=("password",), tarpit_seconds=0.0, max_attempts=10)
+    common = ("password", "admin", "123456", "root", "ubuntu", "toor")
+
+    for username in ("admin", "ubuntu"):
+        client_ip = f"198.51.100.{ord(username[0])}"
+        session_id = "unauthenticated"
+        for password in common:
+            assert await auth.validate_login(client_ip, session_id, username, password) is False
+        assert client_ip not in auth
+        assert not auth.is_locked_out(client_ip)
+
+
+async def test_non_root_rejected_even_with_pinned_password() -> None:
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    client_ip = "203.0.113.50"
+    session_id = auth.create_session(client_ip)
+    pinned = auth.get_or_pin_password(client_ip)
+
+    assert await auth.validate_login(client_ip, session_id, "admin", pinned) is False
+    assert await auth.validate_login(client_ip, session_id, "ubuntu", pinned) is False
+    assert await auth.validate_login(client_ip, session_id, ALLOWED_USERNAME, pinned) is True
+
+
+async def test_root_continues_to_authenticate_cleanly() -> None:
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    client_ip = "203.0.113.51"
+    session_id = auth.create_session(client_ip)
+    pinned = auth.get_or_pin_password(client_ip)
+
+    assert await auth.validate_login(client_ip, session_id, "root", pinned) is True
+    assert client_ip in auth
+    assert not auth.is_locked_out(client_ip)
+
+
+async def test_non_root_failures_increment_attempt_counters() -> None:
+    auth = AuthManager(passwords=("secret",), tarpit_seconds=0.0)
+    client_ip = "203.0.113.52"
+    session_id = "unauthenticated"
+
+    assert await auth.validate_login(client_ip, session_id, "admin", "secret") is False
+    assert await auth.validate_login(client_ip, session_id, "ubuntu", "password") is False
+    with pytest.raises(AuthAttemptLimitExceeded) as exc:
+        await auth.validate_login(client_ip, session_id, "admin", "admin")
+    assert exc.value.session_id == session_id
+    assert auth.is_locked_out(client_ip)
+    assert client_ip not in auth
 
 
 async def test_auth_attempt_telemetry_success_and_failure() -> None:
