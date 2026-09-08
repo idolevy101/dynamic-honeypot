@@ -10,7 +10,10 @@ from shell import CommandResult, SessionState, Shell, lookup_static_output
 from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
+    KERNEL_RELEASE,
     OS_RELEASE,
+    PROC_VERSION,
+    UNAME_A,
     VFSDirectory,
     VFSFile,
     VirtualFileSystem,
@@ -155,7 +158,7 @@ async def test_ls_default_hides_dotfiles(shell: Shell) -> None:
     assert names == sorted(names)
 
     root_listing = await shell.execute("ls /")
-    for expected in ("bin", "etc", "home", "root", "tmp", "var"):
+    for expected in ("bin", "etc", "home", "proc", "root", "tmp", "var"):
         assert expected in root_listing.output.split("  ")
 
 
@@ -225,9 +228,10 @@ async def test_empty_and_whitespace_input_is_noop(shell: Shell) -> None:
 
 
 async def test_unknown_command_message(shell: Shell) -> None:
-    result = await shell.execute("whoami")
-    assert result.output == "bash: whoami: command not found"
+    result = await shell.execute("nosuchcmd")
+    assert result.output == "bash: nosuchcmd: command not found"
     assert not result.exit_session
+    assert result.execution_path == "llm"
 
 
 async def test_shlex_quote_handling(shell: Shell) -> None:
@@ -238,8 +242,8 @@ async def test_shlex_quote_handling(shell: Shell) -> None:
     assert "hostname" in double.output
     assert "os-release" in double.output
 
-    unknown_quoted = await shell.execute('id "root"')
-    assert unknown_quoted.output == "bash: id: command not found"
+    unknown_quoted = await shell.execute('xyzzy "root"')
+    assert unknown_quoted.output == "bash: xyzzy: command not found"
 
 
 async def test_exit_and_logout(shell: Shell) -> None:
@@ -285,11 +289,11 @@ async def test_static_recon_commands_bypass_llm(vfs: VirtualFileSystem) -> None:
 async def test_unknown_command_uses_injected_provider(vfs: VirtualFileSystem) -> None:
     provider = RecordingLLMProvider()
     shell = Shell(vfs, llm_provider=provider)
-    result = await shell.execute("id")
+    result = await shell.execute("getenforce")
     assert result.output == "uid=0(root) gid=0(root) groups=0(root)"
     assert len(provider.calls) == 1
     command, cwd, context = provider.calls[0]
-    assert command == "id"
+    assert command == "getenforce"
     assert cwd == "/root"
     assert context is not None
     assert context["hostname"] == HOSTNAME
@@ -298,20 +302,18 @@ async def test_unknown_command_uses_injected_provider(vfs: VirtualFileSystem) ->
 
 
 async def test_repeated_dynamic_command_uses_llm_cache(vfs: VirtualFileSystem) -> None:
-    lscpu = (
-        "Architecture:                            x86_64\n"
-        "CPU(s):                                  2\n"
-        "Model name:                              Intel(R) Xeon(R) CPU"
-    )
+    status = "● nginx.service - A high performance web server\n     Active: active (running)"
     provider = MagicMock()
-    provider.generate_response = AsyncMock(return_value=lscpu)
+    provider.generate_response = AsyncMock(return_value=status)
     shell = Shell(vfs, llm_provider=provider)
 
-    first = await shell.execute("  lscpu  ")
-    second = await shell.execute("lscpu")
+    first = await shell.execute("  systemctl status nginx  ")
+    second = await shell.execute("systemctl status nginx")
 
-    assert first.output == lscpu
+    assert first.output == status
     assert second.output == first.output
+    assert first.execution_path == "llm"
+    assert second.execution_path == "cache"
     provider.generate_response.assert_called_once()
 
 
@@ -422,3 +424,153 @@ async def test_quoted_operator_is_not_a_chain(shell: Shell) -> None:
     assert result.exit_code == 0
     listing = await shell.execute("ls /tmp")
     assert "x" not in listing.output.split("  ")
+
+
+async def test_cat_proc_and_resolv_are_linux_formatted(shell: Shell) -> None:
+    cpuinfo = await shell.execute("cat /proc/cpuinfo")
+    assert cpuinfo.execution_path == "vfs"
+    assert cpuinfo.exit_code == 0
+    assert "processor\t: 0" in cpuinfo.output
+    assert "processor\t: 1" in cpuinfo.output
+    assert "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz" in cpuinfo.output
+    assert "bogomips" in cpuinfo.output.lower()
+    assert "cache size" in cpuinfo.output
+
+    meminfo = await shell.execute("cat /proc/meminfo")
+    assert meminfo.execution_path == "vfs"
+    assert "MemTotal:" in meminfo.output
+    assert "4016332 kB" in meminfo.output
+    assert "MemFree:" in meminfo.output
+    assert "MemAvailable:" in meminfo.output
+    assert "SwapTotal:" in meminfo.output
+    assert meminfo.output.splitlines()[0].endswith(" kB")
+
+    resolv = await shell.execute("cat /etc/resolv.conf")
+    assert resolv.execution_path == "vfs"
+    assert resolv.output == (
+        "nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n"
+    )
+
+
+async def test_static_identity_and_recon_commands(vfs: VirtualFileSystem) -> None:
+    provider = RecordingLLMProvider()
+    shell = Shell(vfs, llm_provider=provider)
+    cases = {
+        "whoami": "root",
+        "id": "uid=0(root) gid=0(root) groups=0(root)",
+        "hostname": HOSTNAME,
+        "arch": "x86_64",
+        "uname": "Linux",
+        "uname -s": "Linux",
+        "uname -r": KERNEL_RELEASE,
+        "uname -m": "x86_64",
+        "uname -a": UNAME_A,
+        "which bash": "/bin/bash",
+        "lscpu": None,
+        "ip a": None,
+    }
+    for command, expected in cases.items():
+        result = await shell.execute(command)
+        assert result.execution_path == "static", command
+        assert result.exit_code == 0, command
+        if expected is not None:
+            assert result.output == expected, command
+        else:
+            assert result.output
+    lscpu = await shell.execute("lscpu")
+    assert "Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz" in lscpu.output
+    assert "CPU(s):                          2" in lscpu.output
+    ip_a = await shell.execute("ip a")
+    assert "192.168.1.105/24" in ip_a.output
+    assert "52:54:00:12:34:56" in ip_a.output
+    assert "eth0" in ip_a.output
+    assert provider.calls == []
+
+
+async def test_which_unknown_tool_is_empty_static_failure(shell: Shell) -> None:
+    result = await shell.execute("which unknown_tool")
+    assert result.output == ""
+    assert result.exit_code == 1
+    assert result.execution_path == "static"
+
+
+async def test_kernel_identity_is_consistent_across_proc_and_uname(
+    shell: Shell,
+) -> None:
+    version = await shell.execute("cat /proc/version")
+    uname_a = await shell.execute("uname -a")
+    uname_r = await shell.execute("uname -r")
+    assert version.execution_path == "vfs"
+    assert uname_a.execution_path == "static"
+    assert uname_r.execution_path == "static"
+    assert version.output == PROC_VERSION
+    assert uname_r.output == KERNEL_RELEASE
+    assert KERNEL_RELEASE in version.output
+    assert KERNEL_RELEASE in uname_a.output
+    assert "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023" in version.output
+    assert "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023" in uname_a.output
+    assert uname_a.output == UNAME_A
+
+
+async def test_proactive_recon_commands_are_static(vfs: VirtualFileSystem) -> None:
+    provider = RecordingLLMProvider()
+    shell = Shell(vfs, llm_provider=provider)
+
+    env = await shell.execute("env")
+    assert env.execution_path == "static"
+    assert env.exit_code == 0
+    assert "USER=root" in env.output
+    assert f"HOSTNAME={HOSTNAME}" in env.output
+    assert "HOME=/root" in env.output
+    assert f"PWD={shell.state.cwd}" in env.output
+
+    groups = await shell.execute("groups")
+    assert groups.execution_path == "static"
+    assert groups.output == "root"
+
+    crontab = await shell.execute("crontab -l")
+    assert crontab.execution_path == "static"
+    assert crontab.exit_code == 1
+    assert crontab.output == "no crontab for root"
+
+    last = await shell.execute("last")
+    assert last.execution_path == "static"
+    assert "root" in last.output
+    assert "pts/0" in last.output
+    assert KERNEL_RELEASE in last.output
+
+    nproc = await shell.execute("nproc")
+    assert nproc.execution_path == "static"
+    assert nproc.output == "2"
+    assert provider.calls == []
+
+
+async def test_network_and_firewall_static_variants(shell: Shell) -> None:
+    ip_route = await shell.execute("ip route")
+    assert ip_route.execution_path == "static"
+    assert "default via 192.168.1.1 dev eth0" in ip_route.output
+
+    route_n = await shell.execute("route -n")
+    assert route_n.execution_path == "static"
+    assert "192.168.1.1" in route_n.output
+
+    ss = await shell.execute("ss -tulpn")
+    assert ss.execution_path == "static"
+    assert ":22" in ss.output
+    assert "sshd" in ss.output
+
+    netstat = await shell.execute("netstat -tuln")
+    assert netstat.execution_path == "static"
+    assert "0.0.0.0:22" in netstat.output
+
+    iptables = await shell.execute("iptables -L")
+    assert iptables.execution_path == "static"
+    assert "policy ACCEPT" in iptables.output
+
+    ufw = await shell.execute("ufw status")
+    assert ufw.execution_path == "static"
+    assert ufw.output == "Status: inactive"
+
+    dmidecode = await shell.execute("dmidecode -s system-product-name")
+    assert dmidecode.execution_path == "static"
+    assert dmidecode.output == "Standard PC (Q35 + ICH9, 2009)"

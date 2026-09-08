@@ -11,13 +11,18 @@ from typing import Final
 
 HOSTNAME: Final[str] = "ubuntu-srv"
 DEFAULT_HOME: Final[str] = "/root"
+KERNEL_RELEASE: Final[str] = "5.15.0-88-generic"
+KERNEL_VERSION: Final[str] = "#98-Ubuntu SMP Mon Oct 2 15:18:56 UTC 2023"
+UNAME_A: Final[str] = (
+    f"Linux {HOSTNAME} {KERNEL_RELEASE} {KERNEL_VERSION} x86_64 x86_64 x86_64 GNU/Linux"
+)
 _DEFAULT_MTIME: Final[datetime] = datetime(2024, 4, 10, 9, 15, tzinfo=timezone.utc)
 
 OS_RELEASE: Final[str] = """\
-PRETTY_NAME="Ubuntu 22.04.4 LTS"
+PRETTY_NAME="Ubuntu 22.04.3 LTS"
 NAME="Ubuntu"
 VERSION_ID="22.04"
-VERSION="22.04.4 LTS (Jammy Jellyfish)"
+VERSION="22.04.3 LTS (Jammy Jellyfish)"
 VERSION_CODENAME=jammy
 ID=ubuntu
 ID_LIKE=debian
@@ -26,6 +31,124 @@ SUPPORT_URL="https://help.ubuntu.com/"
 BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
 PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
 UBUNTU_CODENAME=jammy
+"""
+
+PROC_VERSION: Final[str] = (
+    f"Linux version {KERNEL_RELEASE} (buildd@lcy02-amd64-044) "
+    "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) "
+    f"{KERNEL_VERSION}\n"
+)
+
+_CPUINFO_FLAGS: Final[str] = (
+    "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 "
+    "clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc "
+    "rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 "
+    "fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave "
+    "avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault invpcid_single "
+    "pti ssbd ibrs ibpb stibp fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid "
+    "mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl "
+    "xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke"
+)
+
+
+def _cpuinfo_block(processor: int) -> str:
+    return f"""\
+processor	: {processor}
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 85
+model name	: Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz
+stepping	: 7
+microcode	: 0x5003306
+cpu MHz		: 2499.998
+cache size	: 36608 KB
+physical id	: 0
+siblings	: 2
+core id		: {processor}
+cpu cores	: 2
+apicid		: {processor}
+initial apicid	: {processor}
+fpu		: yes
+fpu_exception	: yes
+cpuid level	: 13
+wp		: yes
+flags		: {_CPUINFO_FLAGS}
+bugs		: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa itlb_multihit mmio_stale_data
+bogomips	: 4999.99
+clflush size	: 64
+cache_alignment	: 64
+address sizes	: 46 bits physical, 48 bits virtual
+power management:
+"""
+
+
+PROC_CPUINFO: Final[str] = _cpuinfo_block(0) + "\n" + _cpuinfo_block(1)
+
+PROC_MEMINFO: Final[str] = """\
+MemTotal:        4016332 kB
+MemFree:         2891456 kB
+MemAvailable:    3210340 kB
+Buffers:          126844 kB
+Cached:           412768 kB
+SwapCached:            0 kB
+Active:           524288 kB
+Inactive:         312456 kB
+Active(anon):     287104 kB
+Inactive(anon):    10240 kB
+Active(file):     237184 kB
+Inactive(file):   302216 kB
+Unevictable:           0 kB
+Mlocked:               0 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
+Dirty:                64 kB
+Writeback:             0 kB
+AnonPages:        289012 kB
+Mapped:            89432 kB
+Shmem:              2560 kB
+KReclaimable:      98416 kB
+Slab:             142336 kB
+SReclaimable:      98416 kB
+SUnreclaim:        43920 kB
+KernelStack:        4096 kB
+PageTables:         5120 kB
+NFS_Unstable:          0 kB
+Bounce:                0 kB
+WritebackTmp:          0 kB
+CommitLimit:     2008164 kB
+Committed_AS:     612448 kB
+VmallocTotal:   34359738367 kB
+VmallocUsed:       12352 kB
+VmallocChunk:          0 kB
+Percpu:             1024 kB
+HardwareCorrupted:     0 kB
+AnonHugePages:         0 kB
+ShmemHugePages:        0 kB
+ShmemPmdMapped:        0 kB
+FileHugePages:         0 kB
+FilePmdMapped:         0 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+DirectMap4k:      122880 kB
+DirectMap2M:     4063232 kB
+DirectMap1G:           0 kB
+"""
+
+PROC_NET_DEV: Final[str] = """\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:  152384     182    0    0    0     0          0         0   152384     182    0    0    0     0       0          0
+  eth0: 8472192    6234    0    0    0     0          0         0  2156032    4102    0    0    0     0       0          0
+"""
+
+RESOLV_CONF: Final[str] = """\
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .
 """
 
 PASSWD: Final[str] = """\
@@ -161,6 +284,14 @@ def build_honeypot_tree() -> VFSDirectory:
         _file("os-release", OS_RELEASE),
         _file("passwd", PASSWD),
         _file("hostname", f"{HOSTNAME}\n"),
+        _file("resolv.conf", RESOLV_CONF),
+    )
+    proc = _directory(
+        "proc",
+        _file("version", PROC_VERSION),
+        _file("cpuinfo", PROC_CPUINFO),
+        _file("meminfo", PROC_MEMINFO),
+        _directory("net", _file("dev", PROC_NET_DEV)),
     )
     root_home = _directory(
         "root",
@@ -173,6 +304,7 @@ def build_honeypot_tree() -> VFSDirectory:
         _directory("bin"),
         etc,
         home,
+        proc,
         root_home,
         _directory("tmp", mode=0o1777),
         _directory("var", _directory("log")),

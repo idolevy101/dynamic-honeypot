@@ -15,7 +15,7 @@ from shell import Shell
 HOST = "127.0.0.1"
 PORT = 2222
 HOST_KEY_PATH = Path("./ssh_host_key")
-BANNER = "Welcome to Ubuntu 22.04 LTS (GNU/Linux 5.15.0-generic x86_64)"
+BANNER = "Welcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-88-generic x86_64)"
 SWEEP_INTERVAL_SECONDS = 60.0
 
 _DISCONNECT_ERRORS = (

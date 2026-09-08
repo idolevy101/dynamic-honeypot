@@ -113,8 +113,8 @@ async def test_shared_llm_cache_survives_reconnect() -> None:
         llm_provider=provider,
         llm_cache=second_shell_session.llm_cache,
     )
-    first_out = await first.execute("lscpu")
-    second_out = await second.execute("lscpu")
+    first_out = await first.execute("systemctl status nginx")
+    second_out = await second.execute("systemctl status nginx")
     assert first_out.output == second_out.output
     provider.generate_response.assert_called_once()
 

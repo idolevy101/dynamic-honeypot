@@ -21,6 +21,9 @@ from vfs import (
     DEFAULT_HOME,
     HOSTNAME,
     INode,
+    KERNEL_RELEASE,
+    KERNEL_VERSION,
+    UNAME_A,
     VFSDirectory,
     VirtualFileSystem,
     canonicalize,
@@ -77,11 +80,255 @@ tmpfs           198M  4.0K  198M   1% /run/user/0
 
 _FREE_M: Final[str] = """\
                total        used        free      shared  buff/cache   available
-Mem:            1967         248        1421           2         297        1572
+Mem:            3922         476        2823           2         623        3135
 Swap:              0           0           0
 """
 
 _UPTIME: Final[str] = " 01:49:12 up 14 days,  3:22,  1 user,  load average: 0.00, 0.01, 0.00"
+
+_WHOAMI: Final[str] = "root"
+_ID: Final[str] = "uid=0(root) gid=0(root) groups=0(root)"
+_GROUPS: Final[str] = "root"
+_ARCH: Final[str] = "x86_64"
+_NPROC: Final[str] = "2"
+
+_WHO: Final[str] = "root     pts/0        2024-04-10 01:48 (192.168.1.10)"
+
+_W: Final[str] = f"""\
+{_UPTIME}
+USER     TTY      FROM             LOGIN@   IDLE   JCPU   PCPU WHAT
+root     pts/0    192.168.1.10     01:48    0.00s  0.04s  0.00s -bash
+"""
+
+_LAST: Final[str] = f"""\
+root     pts/0        192.168.1.10     Tue Apr 10 01:48   still logged in
+reboot   system boot  {KERNEL_RELEASE} Tue Mar 27 22:27   still running
+
+wtmp begins Tue Mar 27 22:27:11 2024
+"""
+
+_CRONTAB_L: Final[str] = "no crontab for root"
+
+_LSCPU: Final[str] = """\
+Architecture:                    x86_64
+CPU op-mode(s):                  32-bit, 64-bit
+Address sizes:                   46 bits physical, 48 bits virtual
+Byte Order:                      Little Endian
+CPU(s):                          2
+On-line CPU(s) list:             0,1
+Vendor ID:                       GenuineIntel
+Model name:                      Intel(R) Xeon(R) Platinum 8259CL CPU @ 2.50GHz
+CPU family:                      6
+Model:                           85
+Thread(s) per core:              1
+Core(s) per socket:              2
+Socket(s):                       1
+Stepping:                        7
+CPU max MHz:                     2500.0000
+CPU min MHz:                     2500.0000
+BogoMIPS:                        4999.99
+Hypervisor vendor:               KVM
+Virtualization type:             full
+L1d cache:                       64 KiB (2 instances)
+L1i cache:                       64 KiB (2 instances)
+L2 cache:                        2 MiB (2 instances)
+L3 cache:                        35.8 MiB (1 instance)
+NUMA node(s):                    1
+NUMA node0 CPU(s):               0,1
+Vulnerability Itlb multihit:     KVM: Mitigation: VMX unsupported
+Vulnerability L1tf:              Mitigation; PTE Inversion
+Vulnerability Mds:               Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Meltdown:          Mitigation; PTI
+Vulnerability Mmio stale data:   Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Vulnerability Retbleed:          Not affected
+Vulnerability Spec store bypass: Mitigation; Speculative Store Bypass disabled via prctl and seccomp
+Vulnerability Spectre v1:        Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:        Mitigation; Retpolines, IBPB conditional, IBRS_FW, STIBP disabled, RSB filling
+Vulnerability Srbds:             Not affected
+Vulnerability Tsx async abort:   Not affected
+Flags:                           fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault invpcid_single pti ssbd ibrs ibpb stibp fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves ida arat pku ospke
+"""
+
+_LSMOD: Final[str] = """\
+Module                  Size  Used by
+overlay               151552  0
+nls_iso8859_1          16384  1
+dm_multipath           40960  0
+scsi_dh_rdac           20480  0
+scsi_dh_emc            16384  0
+scsi_dh_alua           20480  0
+crct10dif_pclmul       16384  1
+crc32_pclmul           16384  0
+ghash_clmulni_intel    16384  0
+aesni_intel           376832  0
+crypto_simd            16384  1 aesni_intel
+cryptd                 24576  2 crypto_simd,ghash_clmulni_intel
+crc32c_intel           24576  0
+virtio_net             61440  0
+net_failover           20480  1 virtio_net
+failover               16384  1 net_failover
+virtio_blk             20480  2
+virtio_scsi            24576  0
+ext4                  921600  1
+mbcache                16384  1 ext4
+jbd2                  167936  1 ext4
+"""
+
+_DMIDECODE: Final[str] = """\
+# dmidecode 3.3
+Getting SMBIOS data from sysfs.
+SMBIOS 2.8 present.
+
+Handle 0x0001, DMI type 1, 27 bytes
+System Information
+	Manufacturer: QEMU
+	Product Name: Standard PC (Q35 + ICH9, 2009)
+	Version: pc-q35-7.2
+	Serial Number: Not Specified
+	UUID: 12345678-1234-5678-1234-567812345678
+	Wake-up Type: Power Switch
+	SKU Number: Not Specified
+	Family: Not Specified
+"""
+
+_DMIDECODE_PRODUCT: Final[str] = "Standard PC (Q35 + ICH9, 2009)"
+
+_IP_ADDR: Final[str] = """\
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host
+       valid_lft forever preferred_lft forever
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000
+    link/ether 52:54:00:12:34:56 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.1.105/24 brd 192.168.1.255 scope global eth0
+       valid_lft forever preferred_lft forever
+    inet6 fe80::5054:ff:fe12:3456/64 scope link
+       valid_lft forever preferred_lft forever
+"""
+
+_IFCONFIG: Final[str] = """\
+eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet 192.168.1.105  netmask 255.255.255.0  broadcast 192.168.1.255
+        inet6 fe80::5054:ff:fe12:3456  prefixlen 64  scopeid 0x20<link>
+        ether 52:54:00:12:34:56  txqueuelen 1000  (Ethernet)
+        RX packets 6234  bytes 8472192 (8.4 MB)
+        RX errors 0  dropped 0  overruns 0  frame 0
+        TX packets 4102  bytes 2156032 (2.1 MB)
+        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+lo: flags=73<UP,LOOPBACK,RUNNING>  mtu 65536
+        inet 127.0.0.1  netmask 255.0.0.0
+        inet6 ::1  prefixlen 128  scopeid 0x10<host>
+        loop  txqueuelen 1000  (Local Loopback)
+        RX packets 182  bytes 152384 (148.8 KB)
+        RX errors 0  dropped 0  overruns 0  frame 0
+        TX packets 182  bytes 152384 (148.8 KB)
+        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+"""
+
+_IP_ROUTE: Final[str] = """\
+default via 192.168.1.1 dev eth0 proto dhcp src 192.168.1.105 metric 100
+192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.105 metric 100
+"""
+
+_ROUTE_N: Final[str] = """\
+Kernel IP routing table
+Destination     Gateway         Genmask         Flags Metric Ref    Use Iface
+0.0.0.0         192.168.1.1     0.0.0.0         UG    100    0        0 eth0
+192.168.1.0     0.0.0.0         255.255.255.0   U     100    0        0 eth0
+"""
+
+_NETSTAT_TULN: Final[str] = """\
+Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address         State
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN
+tcp        0      0 127.0.0.53:53           0.0.0.0:*               LISTEN
+tcp6       0      0 :::22                   :::*                    LISTEN
+udp        0      0 127.0.0.53:53           0.0.0.0:*
+"""
+
+_SS_TULN: Final[str] = """\
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*
+tcp   LISTEN 0      128        127.0.0.53:53         0.0.0.0:*
+tcp   LISTEN 0      128             [::]:22            [::]:*
+"""
+
+_SS_TULPN: Final[str] = """\
+Netid State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess
+udp   UNCONN 0      0      127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=198,fd=13))
+tcp   LISTEN 0      128          0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=258,fd=3))
+tcp   LISTEN 0      128        127.0.0.53:53         0.0.0.0:*    users:(("systemd-resolve",pid=198,fd=14))
+tcp   LISTEN 0      128             [::]:22            [::]:*    users:(("sshd",pid=258,fd=4))
+"""
+
+_IPTABLES_L: Final[str] = """\
+Chain INPUT (policy ACCEPT)
+target     prot opt source               destination
+
+Chain FORWARD (policy ACCEPT)
+target     prot opt source               destination
+
+Chain OUTPUT (policy ACCEPT)
+target     prot opt source               destination
+"""
+
+_IPTABLES_S: Final[str] = """\
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+"""
+
+_UFW_STATUS: Final[str] = "Status: inactive"
+
+_WHICH_PATHS: Final[dict[str, str]] = {
+    "sh": "/bin/sh",
+    "bash": "/bin/bash",
+    "dash": "/bin/dash",
+    "cat": "/bin/cat",
+    "ls": "/bin/ls",
+    "echo": "/bin/echo",
+    "pwd": "/bin/pwd",
+    "rm": "/bin/rm",
+    "mkdir": "/bin/mkdir",
+    "rmdir": "/bin/rmdir",
+    "touch": "/bin/touch",
+    "cp": "/bin/cp",
+    "mv": "/bin/mv",
+    "chmod": "/bin/chmod",
+    "chown": "/bin/chown",
+    "uname": "/bin/uname",
+    "hostname": "/bin/hostname",
+    "login": "/bin/login",
+    "curl": "/usr/bin/curl",
+    "wget": "/usr/bin/wget",
+    "python3": "/usr/bin/python3",
+    "python": "/usr/bin/python",
+    "gcc": "/usr/bin/gcc",
+    "nc": "/usr/bin/nc",
+    "netcat": "/usr/bin/nc",
+    "iptables": "/usr/bin/iptables",
+    "ss": "/usr/bin/ss",
+    "ip": "/usr/bin/ip",
+    "env": "/usr/bin/env",
+    "which": "/usr/bin/which",
+    "id": "/usr/bin/id",
+    "whoami": "/usr/bin/whoami",
+}
+
+_UNAME_FIELDS: Final[dict[str, str]] = {
+    "s": "Linux",
+    "n": HOSTNAME,
+    "r": KERNEL_RELEASE,
+    "v": KERNEL_VERSION,
+    "m": "x86_64",
+    "p": "x86_64",
+    "i": "x86_64",
+    "o": "GNU/Linux",
+}
 
 _STATIC_OUTPUTS: Final[dict[tuple[str, ...], str]] = {
     ("ps", "aux"): _PS_AUX.rstrip("\n"),
@@ -89,7 +336,48 @@ _STATIC_OUTPUTS: Final[dict[tuple[str, ...], str]] = {
     ("df", "-h"): _DF_H.rstrip("\n"),
     ("free", "-m"): _FREE_M.rstrip("\n"),
     ("uptime",): _UPTIME,
+    ("whoami",): _WHOAMI,
+    ("hostname",): HOSTNAME,
+    ("id",): _ID,
+    ("id", "-u"): "0",
+    ("id", "-g"): "0",
+    ("id", "-un"): "root",
+    ("id", "-gn"): "root",
+    ("arch",): _ARCH,
+    ("w",): _W.rstrip("\n"),
+    ("who",): _WHO,
+    ("lscpu",): _LSCPU.rstrip("\n"),
+    ("lsmod",): _LSMOD.rstrip("\n"),
+    ("dmidecode",): _DMIDECODE.rstrip("\n"),
+    ("dmidecode", "-s", "system-product-name"): _DMIDECODE_PRODUCT,
+    ("dmidecode", "-s", "system-manufacturer"): "QEMU",
+    ("ip", "a"): _IP_ADDR.rstrip("\n"),
+    ("ip", "addr"): _IP_ADDR.rstrip("\n"),
+    ("ip", "address"): _IP_ADDR.rstrip("\n"),
+    ("ip", "addr", "show"): _IP_ADDR.rstrip("\n"),
+    ("ifconfig",): _IFCONFIG.rstrip("\n"),
+    ("ifconfig", "-a"): _IFCONFIG.rstrip("\n"),
+    ("ip", "route"): _IP_ROUTE.rstrip("\n"),
+    ("ip", "r"): _IP_ROUTE.rstrip("\n"),
+    ("route", "-n"): _ROUTE_N.rstrip("\n"),
+    ("route",): _ROUTE_N.rstrip("\n"),
+    ("netstat", "-tuln"): _NETSTAT_TULN.rstrip("\n"),
+    ("ss", "-tuln"): _SS_TULN.rstrip("\n"),
+    ("ss", "-tulpn"): _SS_TULPN.rstrip("\n"),
+    ("iptables", "-L"): _IPTABLES_L.rstrip("\n"),
+    ("iptables", "-S"): _IPTABLES_S.rstrip("\n"),
+    ("ufw", "status"): _UFW_STATUS,
+    ("groups",): _GROUPS,
+    ("nproc",): _NPROC,
+    ("last",): _LAST.rstrip("\n"),
+    ("crontab", "-l"): _CRONTAB_L,
 }
+
+_STATIC_EXIT_CODES: Final[dict[tuple[str, ...], int]] = {
+    ("crontab", "-l"): 1,
+}
+
+_STATIC_HANDLER_COMMANDS: Final[frozenset[str]] = frozenset({"which", "uname", "env"})
 
 _UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset(
     {"date", "timedatectl", "hwclock"}
@@ -295,11 +583,66 @@ def _curl_progress(size: int) -> str:
     )
 
 
+def _short_flags(args: Sequence[str]) -> set[str]:
+    letters: set[str] = set()
+    for arg in args:
+        if arg.startswith("--") or arg == "-":
+            continue
+        if arg.startswith("-"):
+            letters.update(arg[1:])
+    return letters
+
+
+def _lookup_static_aliases(tokens: Sequence[str]) -> str | None:
+    command = tokens[0]
+    args = list(tokens[1:])
+    if command == "ip" and args:
+        if args[0] in {"a", "addr", "address"}:
+            return _IP_ADDR.rstrip("\n")
+        if args[0] in {"r", "route"}:
+            return _IP_ROUTE.rstrip("\n")
+    if command == "ss":
+        flags = _short_flags(args)
+        if "l" in flags:
+            return _SS_TULPN.rstrip("\n") if "p" in flags else _SS_TULN.rstrip("\n")
+    if command == "netstat":
+        flags = _short_flags(args)
+        if "l" in flags:
+            return _NETSTAT_TULN.rstrip("\n")
+    if command == "iptables":
+        flags = _short_flags(args)
+        if "S" in flags:
+            return _IPTABLES_S.rstrip("\n")
+        if "L" in flags or not args:
+            return _IPTABLES_L.rstrip("\n")
+    if command == "ufw" and args and args[0] == "status":
+        return _UFW_STATUS
+    if command == "dmidecode":
+        if args[:2] == ["-s", "system-product-name"]:
+            return _DMIDECODE_PRODUCT
+        if args[:2] == ["-s", "system-manufacturer"]:
+            return "QEMU"
+        if not args:
+            return _DMIDECODE.rstrip("\n")
+    if command == "ifconfig":
+        return _IFCONFIG.rstrip("\n")
+    if command == "route":
+        return _ROUTE_N.rstrip("\n")
+    return None
+
+
 def lookup_static_output(tokens: Sequence[str]) -> str | None:
     """Return a pre-LLM recon template, or None to fall through to the provider."""
     if not tokens:
         return None
-    return _STATIC_OUTPUTS.get(tuple(tokens))
+    exact = _STATIC_OUTPUTS.get(tuple(tokens))
+    if exact is not None:
+        return exact
+    return _lookup_static_aliases(tokens)
+
+
+def lookup_static_exit_code(tokens: Sequence[str]) -> int:
+    return _STATIC_EXIT_CODES.get(tuple(tokens), 0)
 
 
 def _is_cacheable_llm_command(tokens: Sequence[str]) -> bool:
@@ -320,6 +663,7 @@ class CommandResult:
     output: str = ""
     exit_session: bool = False
     exit_code: int = 0
+    execution_path: str = "vfs"
 
     @property
     def ok(self) -> bool:
@@ -362,6 +706,9 @@ class Shell:
             "rmdir": self._cmd_rmdir,
             "wget": self._cmd_wget,
             "curl": self._cmd_curl,
+            "which": self._cmd_which,
+            "uname": self._cmd_uname,
+            "env": self._cmd_env,
             "exit": self._cmd_exit,
             "logout": self._cmd_exit,
         }
@@ -404,6 +751,7 @@ class Shell:
             output="".join(outputs),
             exit_session=last.exit_session,
             exit_code=last.exit_code,
+            execution_path=last.execution_path,
         )
 
     async def _execute_simple(self, line: str) -> CommandResult:
@@ -451,7 +799,12 @@ class Shell:
                 duration_ms=duration_ms,
                 captured_artifacts=self._captured_artifacts,
             )
-        return result
+        return CommandResult(
+            output=result.output,
+            exit_session=result.exit_session,
+            exit_code=result.exit_code,
+            execution_path=execution_path,
+        )
 
     def _apply_redirection(
         self,
@@ -471,7 +824,11 @@ class Shell:
             return _fail(f"bash: {redirect_path}: Not a directory")
         name = redirect_path.rstrip("/").rsplit("/", 1)[-1] or redirect_path
         self._quarantine(name, result.output)
-        return CommandResult(exit_session=result.exit_session, exit_code=result.exit_code)
+        return CommandResult(
+            exit_session=result.exit_session,
+            exit_code=result.exit_code,
+            execution_path=result.execution_path,
+        )
 
     def _quarantine(
         self,
@@ -495,11 +852,19 @@ class Shell:
         command, *args = tokens
         handler = self._handlers.get(command)
         if handler is not None:
-            path = "sinkhole" if command in {"wget", "curl"} else "vfs"
+            if command in {"wget", "curl"}:
+                path = "sinkhole"
+            elif command in _STATIC_HANDLER_COMMANDS:
+                path = "static"
+            else:
+                path = "vfs"
             return handler(args), path
         static = lookup_static_output(tokens)
         if static is not None:
-            return CommandResult(static), "static"
+            return (
+                CommandResult(static, exit_code=lookup_static_exit_code(tokens)),
+                "static",
+            )
         cacheable = _is_cacheable_llm_command(tokens)
         if cacheable and stripped in self._llm_cache:
             output = self._llm_cache[stripped]
@@ -760,6 +1125,61 @@ class Shell:
         if parsed.silent:
             return CommandResult(payload)
         return CommandResult(payload)
+
+    def _cmd_which(self, args: list[str]) -> CommandResult:
+        if not args:
+            return _fail("")
+        lines: list[str] = []
+        missing = False
+        for name in args:
+            path = _WHICH_PATHS.get(name)
+            if path is None:
+                missing = True
+                continue
+            lines.append(path)
+        if missing and not lines:
+            return _fail("")
+        return CommandResult("\n".join(lines), exit_code=1 if missing else 0)
+
+    def _cmd_uname(self, args: list[str]) -> CommandResult:
+        if not args:
+            return CommandResult(_UNAME_FIELDS["s"])
+        flags: list[str] = []
+        for arg in args:
+            if arg in ("-a", "--all"):
+                return CommandResult(UNAME_A)
+            if arg.startswith("--"):
+                continue
+            if arg.startswith("-") and arg != "-":
+                flags.extend(arg[1:])
+        if not flags:
+            return CommandResult(_UNAME_FIELDS["s"])
+        if "a" in flags:
+            return CommandResult(UNAME_A)
+        parts = [_UNAME_FIELDS[flag] for flag in flags if flag in _UNAME_FIELDS]
+        if not parts:
+            return CommandResult(_UNAME_FIELDS["s"])
+        return CommandResult(" ".join(parts))
+
+    def _cmd_env(self, _args: list[str]) -> CommandResult:
+        lines = [
+            "SHELL=/bin/bash",
+            f"PWD={self._state.cwd}",
+            "LOGNAME=root",
+            "HOME=/root",
+            "LANG=C.UTF-8",
+            "TERM=xterm-256color",
+            "USER=root",
+            "SHLVL=1",
+            (
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
+                "/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+            ),
+            "MAIL=/var/mail/root",
+            f"HOSTNAME={HOSTNAME}",
+            "_=/usr/bin/env",
+        ]
+        return CommandResult("\n".join(lines))
 
     def _cmd_exit(self, _args: list[str]) -> CommandResult:
         return CommandResult(exit_session=True)
