@@ -1,8 +1,10 @@
 #pragma once
 
+#include "rate_limiter.hpp"
 #include "socket_utils.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -16,6 +18,10 @@ struct ProxyConfig {
     std::uint16_t bind_port{2200};
     std::string backend_host{"127.0.0.1"};
     std::uint16_t backend_port{2222};
+    std::size_t max_connections{1000};
+    std::size_t max_per_ip{5};
+    std::uint32_t rate_limit{10};
+    std::uint32_t rate_burst{15};
 };
 
 enum class SessionState : std::uint8_t {
@@ -43,6 +49,7 @@ struct ProxySession {
     bool backend_wr_shutdown{false};
     std::uint32_t client_events{0};
     std::uint32_t backend_events{0};
+    RateLimiter::Lease lease;
 };
 
 class ProxyServer {
@@ -67,7 +74,7 @@ private:
     [[nodiscard]] bool setup_epoll();
     void teardown() noexcept;
     void accept_ready();
-    [[nodiscard]] bool spawn_session(UniqueFd client_fd);
+    [[nodiscard]] bool spawn_session(UniqueFd client_fd, std::string client_ip);
     [[nodiscard]] bool open_backend(UniqueFd& out_fd, bool& established);
     void handle_event(std::uint64_t token, std::uint32_t events);
     void handle_session_event(std::uint64_t id, SocketRole role, std::uint32_t events);
@@ -93,6 +100,7 @@ private:
     std::atomic<int> wakeup_raw_{-1};
     std::atomic<bool> running_{false};
     std::uint64_t next_session_id_{1};
+    RateLimiter rate_limiter_;
     std::unordered_map<std::uint64_t, std::unique_ptr<ProxySession>> sessions_;
 };
 

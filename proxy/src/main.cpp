@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <signal.h>
 #include <string_view>
 
@@ -18,6 +20,10 @@ constexpr std::string_view kUsage =
     "  -l, --listen-port <port>   Front-door listen port (default: 2200)\n"
     "  -b, --backend-port <port>  Python SSH backend port (default: 2222)\n"
     "  -h, --backend-host <host>  Python SSH backend host (default: 127.0.0.1)\n"
+    "      --max-connections <n>  Maximum concurrent connections (default: 1000)\n"
+    "      --max-per-ip <n>       Maximum concurrent connections per IP (default: 5)\n"
+    "      --rate-limit <n>       Maximum new connections per IP per second (default: 10)\n"
+    "      --rate-burst <n>       Rate limiter burst size per IP (default: 15)\n"
     "      --dry-run              Initialize the listen socket, print config, and exit\n"
     "      --help                 Show this help and exit\n";
 
@@ -44,6 +50,35 @@ extern "C" void handle_signal(int /*signum*/) {
     return true;
 }
 
+[[nodiscard]] bool parse_positive_size(const char* text, std::size_t& out) {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value == 0UL) {
+        return false;
+    }
+    out = static_cast<std::size_t>(value);
+    return true;
+}
+
+[[nodiscard]] bool parse_positive_u32(const char* text, std::uint32_t& out) {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value == 0UL ||
+        value > static_cast<unsigned long>(std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
+    out = static_cast<std::uint32_t>(value);
+    return true;
+}
+
 [[nodiscard]] const char* require_arg(int argc, char** argv, int& index, std::string_view flag) {
     if (index + 1 >= argc) {
         std::cerr << "[honeypot_proxy] missing argument for " << flag << '\n';
@@ -59,6 +94,10 @@ void print_config(const honeypot::ProxyConfig& cfg, bool dry_run) {
               << " bind_port=" << cfg.bind_port
               << " backend_host=" << cfg.backend_host
               << " backend_port=" << cfg.backend_port
+              << " max_connections=" << cfg.max_connections
+              << " max_per_ip=" << cfg.max_per_ip
+              << " rate_limit=" << cfg.rate_limit
+              << " rate_burst=" << cfg.rate_burst
               << " dry_run=" << (dry_run ? "true" : "false")
               << std::endl;
 }
@@ -136,6 +175,50 @@ int main(int argc, char** argv) {
                 return 2;
             }
             config.backend_host = value;
+            continue;
+        }
+        if (arg == "--max-connections") {
+            const char* const value = require_arg(argc, argv, i, arg);
+            if (value == nullptr) {
+                return 2;
+            }
+            if (!parse_positive_size(value, config.max_connections)) {
+                std::cerr << "[honeypot_proxy] invalid max-connections\n";
+                return 2;
+            }
+            continue;
+        }
+        if (arg == "--max-per-ip") {
+            const char* const value = require_arg(argc, argv, i, arg);
+            if (value == nullptr) {
+                return 2;
+            }
+            if (!parse_positive_size(value, config.max_per_ip)) {
+                std::cerr << "[honeypot_proxy] invalid max-per-ip\n";
+                return 2;
+            }
+            continue;
+        }
+        if (arg == "--rate-limit") {
+            const char* const value = require_arg(argc, argv, i, arg);
+            if (value == nullptr) {
+                return 2;
+            }
+            if (!parse_positive_u32(value, config.rate_limit)) {
+                std::cerr << "[honeypot_proxy] invalid rate-limit\n";
+                return 2;
+            }
+            continue;
+        }
+        if (arg == "--rate-burst") {
+            const char* const value = require_arg(argc, argv, i, arg);
+            if (value == nullptr) {
+                return 2;
+            }
+            if (!parse_positive_u32(value, config.rate_burst)) {
+                std::cerr << "[honeypot_proxy] invalid rate-burst\n";
+                return 2;
+            }
             continue;
         }
         std::cerr << "[honeypot_proxy] unknown option: " << arg << '\n';

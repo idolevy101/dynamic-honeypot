@@ -1,6 +1,8 @@
 #include "proxy_server.hpp"
 
+#include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -125,9 +127,54 @@ void consume_buf(std::vector<std::uint8_t>& buf, std::size_t& head, std::size_t 
     return role == SocketRole::Client ? session.client_wr_shutdown : session.backend_wr_shutdown;
 }
 
+[[nodiscard]] std::string peer_ip(const sockaddr_storage& addr) {
+    char host[INET6_ADDRSTRLEN]{};
+    if (addr.ss_family == AF_INET) {
+        const auto* sa = reinterpret_cast<const sockaddr_in*>(&addr);
+        if (::inet_ntop(
+                AF_INET,
+                &sa->sin_addr,
+                host,
+                static_cast<socklen_t>(sizeof(host))) == nullptr) {
+            return "unknown";
+        }
+        return std::string{host};
+    }
+    if (addr.ss_family == AF_INET6) {
+        const auto* sa = reinterpret_cast<const sockaddr_in6*>(&addr);
+        if (IN6_IS_ADDR_V4MAPPED(&sa->sin6_addr)) {
+            in_addr v4{};
+            std::memcpy(&v4, &sa->sin6_addr.s6_addr[12], sizeof(v4));
+            if (::inet_ntop(
+                    AF_INET,
+                    &v4,
+                    host,
+                    static_cast<socklen_t>(sizeof(host))) == nullptr) {
+                return "unknown";
+            }
+            return std::string{host};
+        }
+        if (::inet_ntop(
+                AF_INET6,
+                &sa->sin6_addr,
+                host,
+                static_cast<socklen_t>(sizeof(host))) == nullptr) {
+            return "unknown";
+        }
+        return std::string{host};
+    }
+    return "unknown";
+}
+
 }  // namespace
 
-ProxyServer::ProxyServer(ProxyConfig config) : config_(std::move(config)) {}
+ProxyServer::ProxyServer(ProxyConfig config)
+    : config_(std::move(config)),
+      rate_limiter_(
+          config_.max_connections,
+          config_.max_per_ip,
+          config_.rate_limit,
+          config_.rate_burst) {}
 
 ProxyServer::~ProxyServer() {
     teardown();
@@ -264,6 +311,7 @@ void ProxyServer::run() {
         for (int i = 0; i < n; ++i) {
             handle_event(events[static_cast<std::size_t>(i)].data.u64, events[static_cast<std::size_t>(i)].events);
         }
+        rate_limiter_.maybe_sweep();
     }
 
     running_.store(false, std::memory_order_release);
@@ -339,13 +387,18 @@ void ProxyServer::accept_ready() {
         UniqueFd client(raw);
         (void)set_nonblocking(client.get());
         (void)set_tcp_nodelay(client.get());
-        if (!spawn_session(std::move(client))) {
+        if (!spawn_session(std::move(client), peer_ip(addr))) {
             continue;
         }
     }
 }
 
-bool ProxyServer::spawn_session(UniqueFd client_fd) {
+bool ProxyServer::spawn_session(UniqueFd client_fd, std::string client_ip) {
+    RateLimiter::Lease lease;
+    if (!rate_limiter_.try_admit(client_ip, lease)) {
+        return false;
+    }
+
     UniqueFd backend_fd;
     bool established = false;
     if (!open_backend(backend_fd, established)) {
@@ -357,6 +410,7 @@ bool ProxyServer::spawn_session(UniqueFd client_fd) {
     session->client_fd = std::move(client_fd);
     session->backend_fd = std::move(backend_fd);
     session->state = established ? SessionState::Established : SessionState::Connecting;
+    session->lease = std::move(lease);
     const std::uint64_t id = next_session_id_++;
 
     if (!set_watch(

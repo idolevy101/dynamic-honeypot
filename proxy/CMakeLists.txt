@@ -9,6 +9,7 @@ add_executable(honeypot_proxy
     src/main.cpp
     src/socket_utils.cpp
     src/proxy_server.cpp
+    src/rate_limiter.cpp
 )
 
 target_include_directories(honeypot_proxy
