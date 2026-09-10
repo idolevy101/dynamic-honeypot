@@ -26,7 +26,7 @@ from llm import (
     is_safe_llm_argv,
     sanitize_listing,
 )
-from sinkhole import filename_from_url, mocked_payload, quarantine_artifact
+from sinkhole import filename_from_url, iso_utc_now, mocked_payload, quarantine_artifact
 from telemetry import record_command
 from vfs import (
     DEFAULT_HOME,
@@ -448,7 +448,6 @@ _HANDLER_NAMES: Final[frozenset[str]] = frozenset(
 _KNOWN_COMMANDS: Final[frozenset[str]] = (
     _HANDLER_NAMES
     | _SHELL_WRAPPERS
-    | _STATIC_HANDLER_COMMANDS
     | frozenset(key[0] for key in _STATIC_OUTPUTS)
     | LLM_ALLOWED_BINARIES
 )
@@ -490,12 +489,7 @@ def _strip_system_prefix(command: str) -> str:
 
 
 def _is_explicit_path(command: str) -> bool:
-    return (
-        command.startswith("/")
-        or command.startswith("./")
-        or command.startswith("../")
-        or "/" in command
-    )
+    return "/" in command
 
 
 def _extract_shell_c(tokens: Sequence[str]) -> str | None:
@@ -622,14 +616,6 @@ def split_pipeline(line: str) -> list[str]:
     return stages
 
 
-def split_command_chain(line: str) -> list[_ChainSegment]:
-    """Split ``;``, ``&&``, and ``||`` outside quotes. Pipes are left intact."""
-    return [
-        _ChainSegment(command, operator)
-        for operator, command in _split_operators(line, (";", "&&", "||"))
-    ]
-
-
 @dataclass(frozen=True)
 class _CurlArgs:
     url: str | None
@@ -716,10 +702,11 @@ def _fake_ipv4(host: str) -> str:
 
 def _wget_progress(url: str, filename: str, size: int) -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    host = urlparse(url).hostname or url
+    parsed = urlparse(url)
+    host = parsed.hostname or url
     ip = _fake_ipv4(host)
-    scheme = urlparse(url).scheme or "http"
-    port = urlparse(url).port or (443 if scheme == "https" else 80)
+    scheme = parsed.scheme or "http"
+    port = parsed.port or (443 if scheme == "https" else 80)
     return (
         f"--{now}--  {url}\n"
         f"Resolving {host} ({host})... {ip}\n"
@@ -833,9 +820,8 @@ def _is_cacheable_llm_command(tokens: Sequence[str]) -> bool:
     return bool(argv0) and argv0 not in _UNCACHEABLE_LLM_COMMANDS
 
 
-def is_llm_eligible_command(tokens: Sequence[str], raw: str = "") -> bool:
+def is_llm_eligible_command(tokens: Sequence[str]) -> bool:
     """True when argv[0] is an allowlisted binary not handled locally."""
-    _ = raw
     if not tokens:
         return False
     return _strip_system_prefix(tokens[0]) in LLM_ALLOWED_BINARIES
@@ -1203,7 +1189,7 @@ class Shell:
         if basename != command and basename in _KNOWN_COMMANDS:
             command = basename
             tokens = [command, *args]
-            stripped = " ".join(tokens) if args else command
+            stripped = " ".join(tokens)
         if command in _SHELL_WRAPPERS:
             inner = _extract_shell_c(tokens)
             if inner is not None:
@@ -1230,10 +1216,9 @@ class Shell:
                 CommandResult(static, exit_code=lookup_static_exit_code(tokens)),
                 "static",
             )
-        if not is_llm_eligible_command(tokens, stripped):
+        if not is_llm_eligible_command(tokens):
             rejected = _not_found_result(command)
             return rejected, "vfs"
-        args = tokens[1:]
         if not is_safe_llm_argv(tokens):
             return self._llm_result(
                 format_binary_usage_error(command, args),
@@ -1583,7 +1568,7 @@ class Shell:
                 "wget: missing URL\nUsage: wget [OPTION]... [URL]...\n"
             )
         target = output_path if output_path is not None else filename_from_url(url)
-        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        timestamp = iso_utc_now()
         payload = mocked_payload(url, self._client_ip, timestamp)
         try:
             self._vfs.write_file(target, payload, self._state.cwd)
@@ -1606,7 +1591,7 @@ class Shell:
         if parsed.url is None:
             return _fail("curl: no URL specified!")
         url = parsed.url
-        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        timestamp = iso_utc_now()
         payload = mocked_payload(url, self._client_ip, timestamp)
         target = parsed.output_path
         if target is None and parsed.remote_name:
@@ -1614,11 +1599,7 @@ class Shell:
         if target is not None:
             try:
                 self._vfs.write_file(target, payload, self._state.cwd)
-            except FileNotFoundError:
-                return _fail("curl: (23) Failure writing output to destination")
-            except IsADirectoryError:
-                return _fail("curl: (23) Failure writing output to destination")
-            except NotADirectoryError:
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
                 return _fail("curl: (23) Failure writing output to destination")
             except VFSFileTooLargeError:
                 return _fail("bash: curl: write error: File too large")
@@ -1684,13 +1665,7 @@ class Shell:
     def _exec_trap(self, path: str) -> CommandResult:
         try:
             node = self._vfs.resolve(path, self._state.cwd)
-        except FileNotFoundError:
-            return CommandResult(
-                output=_ensure_trailing_newline(f"bash: {path}: No such file or directory"),
-                exit_code=127,
-                execution_path="exec_trap",
-            )
-        except NotADirectoryError:
+        except (FileNotFoundError, NotADirectoryError):
             return CommandResult(
                 output=_ensure_trailing_newline(f"bash: {path}: No such file or directory"),
                 exit_code=127,

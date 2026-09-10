@@ -84,9 +84,6 @@ _IDENTIFIER_RE: Final[re.Pattern[str]] = re.compile(
 )
 _ARGV_MAX_LEN: Final[int] = 64
 _UNSAFE_ARGV_CHARS: Final[frozenset[str]] = frozenset(" \t\n\r?!")
-_TARGET_VERBS: Final[frozenset[str]] = frozenset(
-    {"status", "install", "start", "stop"}
-)
 
 _CONVERSATIONAL_OUTPUT_RES: Final[tuple[re.Pattern[str], ...]] = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -202,21 +199,7 @@ _APT_VERBS: Final[frozenset[str]] = frozenset(
 _PRIMARY_SUBCOMMANDS: Final[frozenset[str]] = (
     _SYSTEMCTL_VERBS
     | _APT_VERBS
-    | frozenset(
-        {
-            "status",
-            "start",
-            "stop",
-            "restart",
-            "reload",
-            "addr",
-            "address",
-            "link",
-            "route",
-            "rule",
-            "neigh",
-        }
-    )
+    | frozenset({"addr", "address", "link", "route", "rule", "neigh"})
 )
 _HARMLESS_FLAGS: Final[frozenset[str]] = frozenset(
     {
@@ -286,11 +269,9 @@ def is_safe_llm_argv(tokens: Sequence[str]) -> bool:
     for arg in tokens[1:]:
         if len(arg) > _ARGV_MAX_LEN:
             return False
-        if any(char in _UNSAFE_ARGV_CHARS for char in arg):
+        if not _UNSAFE_ARGV_CHARS.isdisjoint(arg):
             return False
         if arg.startswith("-") and arg != "-":
-            continue
-        if arg in _TARGET_VERBS:
             continue
         if not _IDENTIFIER_RE.fullmatch(arg):
             return False
@@ -304,22 +285,18 @@ def _binary_name(binary: str) -> str:
 def _is_skipped_token(token: str) -> bool:
     if token in _PRIMARY_SUBCOMMANDS or token in _HARMLESS_FLAGS:
         return True
-    if token.startswith("-") and token.lstrip("-").isalpha() and len(token) <= 5:
-        return True
-    return False
+    return token.startswith("-") and token.lstrip("-").isalpha() and len(token) <= 5
 
 
 def _offending_argument(args: Sequence[str]) -> str | None:
-    leftover = [arg for arg in args if arg and not _is_skipped_token(arg)]
-    if leftover:
-        return leftover[-1]
+    for arg in reversed(args):
+        if arg and not _is_skipped_token(arg):
+            return arg
     return None
 
 
 def _systemctl_unit_name(raw: str) -> str:
-    if any(raw.endswith(suffix) for suffix in _UNIT_SUFFIXES):
-        return raw
-    return f"{raw}.service"
+    return raw if raw.endswith(_UNIT_SUFFIXES) else f"{raw}.service"
 
 
 def format_binary_usage_error(

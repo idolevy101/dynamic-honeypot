@@ -52,12 +52,10 @@ def parse_proxy_v1_line(line: bytes) -> tuple[str, int] | None:
     except UnicodeDecodeError:
         return None
     parts = text.split(" ")
-    if len(parts) < 2 or parts[0] != "PROXY":
+    if len(parts) < 6 or parts[0] != "PROXY":
         return None
     family = parts[1]
-    if family == "UNKNOWN":
-        return None
-    if family not in {"TCP4", "TCP6"} or len(parts) < 6:
+    if family not in {"TCP4", "TCP6"}:
         return None
     client_ip = parts[2]
     if not client_ip:
