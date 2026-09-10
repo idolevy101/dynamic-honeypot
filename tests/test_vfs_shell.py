@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from llm import NullLLMProvider
-from server import handle_client
+from llm import LLMSimulation, NullLLMProvider
+from server import BANNER, handle_client, normalize_crlf
 from session_manager import SessionManager
 from shell import CommandResult, SessionState, Shell, format_uname, lookup_static_output
 from vfs import (
@@ -34,16 +34,18 @@ from vfs import (
 
 class RecordingLLMProvider(NullLLMProvider):
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
+        self.calls: list[tuple[str, str, dict[str, Any] | None, list[str]]] = []
 
     async def generate_response(
         self,
         command: str,
         cwd: str,
         context: dict[str, Any] | None = None,
-    ) -> str:
-        self.calls.append((command, cwd, context))
-        return "uid=0(root) gid=0(root) groups=0(root)"
+        *,
+        argv: list[str] | tuple[str, ...] | None = None,
+    ) -> LLMSimulation:
+        self.calls.append((command, cwd, context, list(argv or [])))
+        return LLMSimulation(stdout="uid=0(root) gid=0(root) groups=0(root)")
 
 
 @pytest.fixture
@@ -243,7 +245,8 @@ async def test_unknown_command_message(shell: Shell) -> None:
     result = await shell.execute("nosuchcmd")
     assert result.output == "bash: nosuchcmd: command not found\n"
     assert not result.exit_session
-    assert result.execution_path == "llm"
+    assert result.exit_code == 127
+    assert result.execution_path == "vfs"
 
 
 async def test_shlex_quote_handling(shell: Shell) -> None:
@@ -304,43 +307,52 @@ async def test_static_recon_commands_bypass_llm(vfs: VirtualFileSystem) -> None:
 async def test_unknown_command_uses_injected_provider(vfs: VirtualFileSystem) -> None:
     provider = RecordingLLMProvider()
     shell = Shell(vfs, llm_provider=provider)
-    result = await shell.execute("getenforce")
-    assert result.output == "uid=0(root) gid=0(root) groups=0(root)"
+    result = await shell.execute("sestatus")
+    assert result.output == "uid=0(root) gid=0(root) groups=0(root)\n"
     assert len(provider.calls) == 1
-    command, cwd, context = provider.calls[0]
-    assert command == "getenforce"
+    command, cwd, context, argv = provider.calls[0]
+    assert command == "sestatus"
+    assert argv == ["sestatus"]
     assert cwd == "/root"
     assert context is not None
     assert context["hostname"] == HOSTNAME
     assert context["user"] == "root"
+    assert context["argv0"] == "sestatus"
     assert ".bash_history" in context["listing"]
 
 
 async def test_repeated_dynamic_command_uses_llm_cache(vfs: VirtualFileSystem) -> None:
     status = "● nginx.service - A high performance web server\n     Active: active (running)"
     provider = MagicMock()
-    provider.generate_response = AsyncMock(return_value=status)
+    provider.generate_response = AsyncMock(
+        return_value=LLMSimulation(stdout=status)
+    )
     shell = Shell(vfs, llm_provider=provider)
 
     first = await shell.execute("  systemctl status nginx  ")
     second = await shell.execute("systemctl status nginx")
 
-    assert first.output == status
+    assert first.output == status + "\n"
     assert second.output == first.output
     assert first.execution_path == "llm"
     assert second.execution_path == "cache"
     provider.generate_response.assert_called_once()
+    kwargs = provider.generate_response.await_args.kwargs
+    assert kwargs["argv"] == ["systemctl", "status", "nginx"]
 
 
 async def test_date_commands_are_not_llm_cached(vfs: VirtualFileSystem) -> None:
     provider = MagicMock()
     provider.generate_response = AsyncMock(
-        side_effect=["Tue Sep  8 02:08:01 UTC 2026", "Tue Sep  8 02:08:02 UTC 2026"]
+        side_effect=[
+            LLMSimulation(stdout="Tue Sep  8 02:08:01 UTC 2026"),
+            LLMSimulation(stdout="Tue Sep  8 02:08:02 UTC 2026"),
+        ]
     )
     shell = Shell(vfs, llm_provider=provider)
 
-    first = await shell.execute("date")
-    second = await shell.execute("date")
+    first = await shell.execute("timedatectl")
+    second = await shell.execute("timedatectl")
 
     assert first.output != second.output
     assert provider.generate_response.call_count == 2
@@ -922,10 +934,11 @@ async def test_quoted_operators_are_literal_text(shell: Shell) -> None:
 async def test_pipeline_unknown_command_receives_stdin(vfs: VirtualFileSystem) -> None:
     provider = RecordingLLMProvider()
     shell = Shell(vfs, llm_provider=provider)
-    await shell.execute("echo hello | nosuch")
+    await shell.execute("echo hello | sestatus")
     assert len(provider.calls) == 1
-    command, _cwd, context = provider.calls[0]
-    assert command.startswith("nosuch")
+    command, _cwd, context, argv = provider.calls[0]
+    assert argv == ["sestatus"]
+    assert command.startswith("sestatus")
     assert "hello" in command
     assert context is not None
     assert context["stdin"] == "hello\n"
@@ -1200,8 +1213,8 @@ async def test_noninteractive_ssh_exec_guarantees_trailing_newline() -> None:
     manager = SessionManager(max_sessions=8, ttl_seconds=3600)
     process = _FakeSshProcess("echo -n hello")
     await handle_client(process, NullLLMProvider(), manager)
-    assert process.stdout.text == "hello\n"
-    assert process.stdout.text.endswith("\n")
+    assert process.stdout.text == "hello\r\n"
+    assert process.stdout.text.endswith("\r\n")
     assert process.exit_code == 0
 
 
@@ -1221,6 +1234,7 @@ class _FakeSshProcess:
     def __init__(self, command: str | None) -> None:
         self.command = command
         self.stdout = _FakeSshStdout()
+        self.stderr = _FakeSshStdout()
         self.stdin = MagicMock()
         self.stdin.readline = AsyncMock(return_value="")
         self.channel = MagicMock()
@@ -1239,3 +1253,63 @@ class _FakeSshProcess:
 
     def get_extra_info(self, _name: str, default: object = None) -> object:
         return default
+
+
+def test_normalize_crlf_converts_all_line_endings() -> None:
+    assert normalize_crlf("") == ""
+    assert normalize_crlf("root@ubuntu-srv:~# ") == "root@ubuntu-srv:~# "
+    assert normalize_crlf("hello\n") == "hello\r\n"
+    assert normalize_crlf("a\nb\n") == "a\r\nb\r\n"
+    assert normalize_crlf("a\r\nb\r\n") == "a\r\nb\r\n"
+    assert normalize_crlf("a\rb\r") == "a\r\nb\r\n"
+    assert (
+        normalize_crlf("bash: nosuchcmd: command not found\n")
+        == "bash: nosuchcmd: command not found\r\n"
+    )
+
+
+async def test_interactive_ssh_writes_use_crlf_alignment() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeSshProcess(None)
+    process.stdin.readline = AsyncMock(side_effect=["pwd\n", "nosuchcmd\n", ""])
+    await handle_client(process, NullLLMProvider(), manager)
+    text = process.stdout.text
+
+    assert text.startswith(f"{BANNER}\r\n")
+    assert "root@ubuntu-srv:~# " in text
+    assert "/root\r\n" in text
+    assert "bash: nosuchcmd: command not found\r\n" in text
+    assert process.stderr.text == ""
+    assert text.count("bash: nosuchcmd: command not found") == 1
+    assert "\n" not in text.replace("\r\n", "")
+    prompt = "root@ubuntu-srv:~# "
+    assert not prompt.endswith("\r\n")
+    assert text.endswith(prompt)
+    assert process.exit_code == 0
+
+
+async def test_ssh_channel_does_not_duplicate_command_output() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeSshProcess(None)
+    process.stdin.readline = AsyncMock(
+        side_effect=["echo once\n", "nosuchcmd\n", ""]
+    )
+    await handle_client(process, NullLLMProvider(), manager)
+    text = process.stdout.text
+    assert text.count("once") == 1
+    assert text.count("bash: nosuchcmd: command not found") == 1
+    assert process.stderr.text == ""
+    lines = text.split("\r\n")
+    for index, line in enumerate(lines[:-1]):
+        if line in {"once", "bash: nosuchcmd: command not found"}:
+            assert lines[index + 1] != line
+
+
+async def test_noninteractive_unknown_command_crlf_and_exit_127() -> None:
+    manager = SessionManager(max_sessions=8, ttl_seconds=3600)
+    process = _FakeSshProcess("nosuchcmd")
+    await handle_client(process, NullLLMProvider(), manager)
+    assert process.stdout.text == "bash: nosuchcmd: command not found\r\n"
+    assert process.stderr.text == ""
+    assert process.exit_code == 127
+    assert process.stdout.text.count("bash: nosuchcmd: command not found") == 1

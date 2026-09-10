@@ -16,3 +16,6 @@ Hard Rules:
 Always maintain identity consistency across all outputs and simulated files:
 Ubuntu 22.04 LTS, x86_64, Kernel 5.15.0-88-generic, hostname 'ubuntu-srv', user 'root' (uid=0).
 Never introduce conflicting kernel, architecture, or OS release details.
+8. - Strive for minimal, cohesive solutions. Do not introduce speculative abstractions, unused helper functions, or dead code.
+- Prefer reusing existing utilities (e.g., `normalize_crlf`, `format_binary_usage_error`) over adding parallel logic.
+- Never compromise security boundaries, input validation, or defense-in-depth guardrails to reduce line count.

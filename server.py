@@ -337,21 +337,25 @@ async def ensure_host_key(path: Path) -> None:
     await asyncio.to_thread(key.write_private_key, path)
 
 
-def _stdout_crlf(text: str) -> str:
+def normalize_crlf(text: str) -> str:
+    """Convert all line endings to explicit ``\\r\\n`` without adding a new terminator."""
     if not text:
         return ""
-    lines = text.splitlines()
-    while lines and lines[-1] == "":
-        lines.pop()
-    if not lines:
-        return ""
-    return "".join(f"{line}\r\n" for line in lines)
+    unix = text.replace("\r\n", "\n").replace("\r", "\n")
+    trailing = unix.endswith("\n")
+    body = unix[:-1] if trailing else unix
+    converted = body.replace("\n", "\r\n")
+    return f"{converted}\r\n" if trailing else converted
 
 
-def _ensure_trailing_newline(text: str) -> str:
-    if text and not text.endswith("\n"):
-        return f"{text}\n"
-    return text
+def _channel_write(stream: object, text: str, *, complete: bool = False) -> None:
+    writer = getattr(stream, "write", None)
+    if not callable(writer) or not text:
+        return
+    payload = text
+    if complete and not payload.endswith("\n"):
+        payload += "\n"
+    writer(normalize_crlf(payload))
 
 
 async def handle_client(
@@ -376,18 +380,18 @@ async def handle_client(
         if command:
             result = await shell.execute(command)
             if result.output:
-                process.stdout.write(_ensure_trailing_newline(result.output))
+                _channel_write(process.stdout, result.output, complete=True)
             exit_code = result.exit_code
         else:
-            process.stdout.write(f"{BANNER}\r\n")
+            _channel_write(process.stdout, BANNER, complete=True)
             while True:
-                process.stdout.write(shell.prompt())
+                _channel_write(process.stdout, shell.prompt(), complete=False)
                 line = await process.stdin.readline()
                 if not line:
                     break
                 result = await shell.execute(line.rstrip("\r\n"))
                 if result.output:
-                    process.stdout.write(_stdout_crlf(result.output))
+                    _channel_write(process.stdout, result.output, complete=True)
                 if result.exit_session:
                     break
     except asyncio.CancelledError:

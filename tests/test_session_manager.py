@@ -5,7 +5,7 @@ import contextlib
 from unittest.mock import AsyncMock, MagicMock
 
 from auth import AuthManager
-from llm import NullLLMProvider
+from llm import LLMSimulation, NullLLMProvider
 from server import BANNER, HoneypotServer, handle_client, _periodic_sweep
 from session_manager import SessionManager
 from shell import Shell
@@ -104,7 +104,9 @@ async def test_shared_llm_cache_survives_reconnect() -> None:
     manager = SessionManager(max_sessions=8, ttl_seconds=3600)
     record = manager.get_or_create(IP_A)
     provider = MagicMock()
-    provider.generate_response = AsyncMock(return_value="Architecture: x86_64")
+    provider.generate_response = AsyncMock(
+        return_value=LLMSimulation(stdout="Architecture: x86_64")
+    )
 
     first = Shell(record.vfs, llm_provider=provider, llm_cache=record.llm_cache)
     second_shell_session = manager.get_or_create(IP_A)
@@ -116,6 +118,7 @@ async def test_shared_llm_cache_survives_reconnect() -> None:
     first_out = await first.execute("systemctl status nginx")
     second_out = await second.execute("systemctl status nginx")
     assert first_out.output == second_out.output
+    assert first_out.output == "Architecture: x86_64\n"
     provider.generate_response.assert_called_once()
 
 
@@ -212,7 +215,7 @@ async def test_noninteractive_exec_runs_without_banner_or_prompt() -> None:
     await handle_client(process, NullLLMProvider(), manager)
     assert BANNER not in process.stdout.text
     assert "root@ubuntu-srv" not in process.stdout.text
-    assert process.stdout.text == "unwrapped\n"
+    assert process.stdout.text == "unwrapped\r\n"
     assert process.exit_code == 0
     assert process.closed is True
     process.stdin.readline.assert_not_called()
@@ -222,6 +225,6 @@ async def test_noninteractive_exec_output_ends_with_newline() -> None:
     manager = SessionManager(max_sessions=8, ttl_seconds=3600)
     process = _FakeProcess("pwd")
     await handle_client(process, NullLLMProvider(), manager)
-    assert process.stdout.text == "/root\n"
-    assert process.stdout.text.endswith("\n")
+    assert process.stdout.text == "/root\r\n"
+    assert process.stdout.text.endswith("\r\n")
     assert process.exit_code == 0

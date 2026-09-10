@@ -16,7 +16,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Final, Protocol, Sequence
 from urllib.parse import urlparse
 
-from llm import LLMProvider, NullLLMProvider
+from llm import (
+    LLMProvider,
+    LLMSimulation,
+    NullLLMProvider,
+    coerce_llm_simulation,
+    format_binary_usage_error,
+    format_command_not_found,
+    is_safe_llm_argv,
+    sanitize_listing,
+)
 from sinkhole import filename_from_url, mocked_payload, quarantine_artifact
 from telemetry import record_command
 from vfs import (
@@ -386,9 +395,25 @@ _STATIC_EXIT_CODES: Final[dict[tuple[str, ...], int]] = {
 
 _STATIC_HANDLER_COMMANDS: Final[frozenset[str]] = frozenset({"which", "uname", "env"})
 
-_UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset(
-    {"date", "timedatectl", "hwclock"}
+LLM_ALLOWED_BINARIES: Final[frozenset[str]] = frozenset(
+    {
+        "systemctl",
+        "service",
+        "iptables",
+        "dpkg",
+        "apt",
+        "apt-get",
+        "crontab",
+        "timedatectl",
+        "apparmor_status",
+        "sestatus",
+        "lscpu",
+        "netstat",
+        "ip",
+    }
 )
+
+_UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset({"timedatectl"})
 
 
 _STDERR_REDIRECTS: Final[frozenset[str]] = frozenset({"2>&1", "2>/dev/null"})
@@ -425,6 +450,7 @@ _KNOWN_COMMANDS: Final[frozenset[str]] = (
     | _SHELL_WRAPPERS
     | _STATIC_HANDLER_COMMANDS
     | frozenset(key[0] for key in _STATIC_OUTPUTS)
+    | LLM_ALLOWED_BINARIES
 )
 
 
@@ -803,7 +829,23 @@ def lookup_static_exit_code(tokens: Sequence[str]) -> int:
 
 
 def _is_cacheable_llm_command(tokens: Sequence[str]) -> bool:
-    return bool(tokens) and tokens[0] not in _UNCACHEABLE_LLM_COMMANDS
+    argv0 = _strip_system_prefix(tokens[0]) if tokens else ""
+    return bool(argv0) and argv0 not in _UNCACHEABLE_LLM_COMMANDS
+
+
+def is_llm_eligible_command(tokens: Sequence[str], raw: str = "") -> bool:
+    """True when argv[0] is an allowlisted binary not handled locally."""
+    _ = raw
+    if not tokens:
+        return False
+    return _strip_system_prefix(tokens[0]) in LLM_ALLOWED_BINARIES
+
+
+def _not_found_result(command_name: str) -> CommandResult:
+    return CommandResult(
+        output=_ensure_trailing_newline(format_command_not_found(command_name)),
+        exit_code=127,
+    )
 
 
 @dataclass
@@ -1188,29 +1230,47 @@ class Shell:
                 CommandResult(static, exit_code=lookup_static_exit_code(tokens)),
                 "static",
             )
+        if not is_llm_eligible_command(tokens, stripped):
+            rejected = _not_found_result(command)
+            return rejected, "vfs"
+        args = tokens[1:]
+        if not is_safe_llm_argv(tokens):
+            return self._llm_result(
+                format_binary_usage_error(command, args),
+                "vfs",
+            )
         cacheable = _is_cacheable_llm_command(tokens)
         cache_key = stripped if not stdin else f"{stripped}\0{stdin}"
         if cacheable and cache_key in self._llm_cache:
-            output = self._llm_cache[cache_key]
-            if "command not found" in output:
-                output = _ensure_trailing_newline(output)
-                return CommandResult(output, exit_code=127), "cache"
-            return CommandResult(output, exit_code=0), "cache"
+            simulation = coerce_llm_simulation(
+                self._llm_cache[cache_key], command, args
+            )
+            return self._llm_result(simulation, "cache")
         context = self._llm_context()
         if stdin:
             context["stdin"] = stdin
+        context["argv0"] = command
+        context["argv"] = list(args)
         llm_command = stripped if not stdin else f"{stripped}\n{stdin}"
-        output = await self._llm_provider.generate_response(
+        raw = await self._llm_provider.generate_response(
             llm_command,
             self._state.cwd,
             context,
+            argv=tokens,
         )
+        simulation = coerce_llm_simulation(raw, command, args)
         if cacheable:
-            self._llm_cache[cache_key] = output
-        if "command not found" in output:
-            output = _ensure_trailing_newline(output)
-            return CommandResult(output, exit_code=127), "llm"
-        return CommandResult(output, exit_code=0), "llm"
+            self._llm_cache[cache_key] = simulation.to_json()
+        return self._llm_result(simulation, "llm")
+
+    def _llm_result(
+        self, simulation: LLMSimulation, execution_path: str
+    ) -> tuple[CommandResult, str]:
+        output = simulation.rendered()
+        return (
+            CommandResult(output=output, exit_code=simulation.exit_code),
+            execution_path,
+        )
 
     def _llm_context(self) -> dict[str, Any]:
         try:
@@ -1220,7 +1280,8 @@ class Shell:
         return {
             "hostname": HOSTNAME,
             "user": "root",
-            "listing": listing,
+            "listing": sanitize_listing(listing),
+            "file_count": len(listing),
         }
 
     def _cmd_pwd(self, _args: list[str]) -> CommandResult:
