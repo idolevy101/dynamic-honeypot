@@ -6,3 +6,4 @@ ssh_host_key*
 quarantine/
 logs/
 proxy/build/
+ONBOARDING.md
