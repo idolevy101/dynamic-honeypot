@@ -419,6 +419,9 @@ _UNCACHEABLE_LLM_COMMANDS: Final[frozenset[str]] = frozenset({"timedatectl"})
 _STDERR_REDIRECTS: Final[frozenset[str]] = frozenset({"2>&1", "2>/dev/null"})
 _SYSTEM_BIN_PREFIXES: Final[tuple[str, ...]] = ("/usr/bin/", "/sbin/", "/bin/")
 _SHELL_WRAPPERS: Final[frozenset[str]] = frozenset({"sh", "bash", "dash"})
+_MAX_SCRIPT_DEPTH: Final[int] = 3
+_MAX_SCRIPT_LINES: Final[int] = 50
+_ELF_MAGIC: Final[str] = "\x7fELF"
 _HANDLER_NAMES: Final[frozenset[str]] = frozenset(
     {
         "pwd",
@@ -497,6 +500,26 @@ def _extract_shell_c(tokens: Sequence[str]) -> str | None:
         if token == "-c" and index + 1 < len(tokens):
             return tokens[index + 1]
     return None
+
+
+def _shell_script_operand(args: Sequence[str]) -> str | None:
+    for arg in args:
+        if arg.startswith("-"):
+            continue
+        return arg
+    return None
+
+
+def _is_binary_script(content: str) -> bool:
+    if content.startswith(_ELF_MAGIC):
+        return True
+    for char in content:
+        code = ord(char)
+        if code < 32 and char not in "\t\n\r":
+            return True
+        if code == 127:
+            return True
+    return False
 
 
 class _CwdPersist(Protocol):
@@ -933,6 +956,7 @@ class Shell:
             "history": self._cmd_history,
             "unset": self._cmd_unset,
         }
+        self._script_depth = 0
 
     @property
     def state(self) -> SessionState:
@@ -1041,7 +1065,10 @@ class Shell:
                                     else " ".join(command_tokens)
                                 )
                                 result, execution_path = await self._dispatch(
-                                    command_tokens, dispatch_line, stdin
+                                    command_tokens,
+                                    dispatch_line,
+                                    stdin,
+                                    depth=self._script_depth,
                                 )
                             if redirect_path is not None:
                                 result = self._apply_redirection(
@@ -1181,8 +1208,38 @@ class Shell:
         if isinstance(sha256, str) and sha256:
             self._captured_artifacts.append(sha256)
 
+    async def _execute_script_lines(
+        self, lines: list[str], depth: int = 0
+    ) -> CommandResult:
+        if depth > _MAX_SCRIPT_DEPTH:
+            return _fail("bash: maximum recursion depth exceeded", exit_code=1)
+        if len(lines) > _MAX_SCRIPT_LINES:
+            return _fail("bash: maximum script length exceeded", exit_code=1)
+        previous_depth = self._script_depth
+        self._script_depth = depth
+        outputs: list[str] = []
+        last = CommandResult()
+        try:
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                last = await self.execute(stripped)
+                if last.output:
+                    outputs.append(last.output)
+                if last.exit_session:
+                    break
+        finally:
+            self._script_depth = previous_depth
+        return CommandResult(
+            output=_join_outputs(outputs),
+            exit_session=last.exit_session,
+            exit_code=last.exit_code,
+            execution_path=last.execution_path,
+        )
+
     async def _dispatch(
-        self, tokens: list[str], stripped: str, stdin: str = ""
+        self, tokens: list[str], stripped: str, stdin: str = "", depth: int = 0
     ) -> tuple[CommandResult, str]:
         command, *args = tokens
         basename = _strip_system_prefix(command)
@@ -1195,6 +1252,42 @@ class Shell:
             if inner is not None:
                 inner_result = await self.execute(inner)
                 return inner_result, inner_result.execution_path
+            script_path = _shell_script_operand(args)
+            if script_path is not None:
+                try:
+                    node = self._vfs.resolve(script_path, self._state.cwd)
+                except (FileNotFoundError, NotADirectoryError):
+                    return (
+                        _fail(
+                            f"{command}: {script_path}: No such file or directory",
+                            exit_code=127,
+                        ),
+                        "vfs",
+                    )
+                if isinstance(node, VFSDirectory) or not isinstance(node, VFSFile):
+                    return (
+                        _fail(f"{command}: {script_path}: Is a directory", exit_code=126),
+                        "vfs",
+                    )
+                content = self._vfs.read_file(script_path, self._state.cwd)
+                if _is_binary_script(content):
+                    return (
+                        _fail(
+                            f"{script_path}: cannot execute binary file: "
+                            "Exec format error",
+                            exit_code=126,
+                        ),
+                        "vfs",
+                    )
+                result = await self._execute_script_lines(
+                    content.splitlines(), depth=depth + 1
+                )
+                return result, result.execution_path
+            if stdin:
+                result = await self._execute_script_lines(
+                    stdin.splitlines(), depth=depth
+                )
+                return result, result.execution_path
             return CommandResult(), "vfs"
         if _is_explicit_path(command):
             trapped = self._exec_trap(command)

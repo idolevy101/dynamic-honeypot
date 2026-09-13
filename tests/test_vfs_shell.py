@@ -963,6 +963,43 @@ async def test_sh_c_unwraps_inner_command(shell: Shell) -> None:
     assert bash_c.exit_code == 0
 
 
+async def test_sh_executes_vfs_script(shell: Shell, vfs: VirtualFileSystem) -> None:
+    vfs.write_file(
+        "/tmp/script.sh",
+        "#!/bin/sh\n\n# dropper body\ntouch /tmp/created.txt\necho done\n",
+        "/",
+    )
+    result = await shell.execute("sh /tmp/script.sh")
+    assert result.exit_code == 0
+    assert result.output == "done\n"
+    created = vfs.get("/tmp/created.txt", "/")
+    assert isinstance(created, VFSFile)
+
+
+async def test_piped_sh_execution(shell: Shell, vfs: VirtualFileSystem) -> None:
+    result = await shell.execute('echo "touch /tmp/p" | sh')
+    assert result.exit_code == 0
+    created = vfs.get("/tmp/p", "/")
+    assert isinstance(created, VFSFile)
+
+
+async def test_sh_rejects_elf_binary(shell: Shell, vfs: VirtualFileSystem) -> None:
+    vfs.write_file("/tmp/payload", "\x7fELF\x01\x00\x02\x00", "/")
+    result = await shell.execute("sh /tmp/payload")
+    assert result.exit_code == 126
+    assert result.output == (
+        "/tmp/payload: cannot execute binary file: Exec format error\n"
+    )
+
+
+async def test_sh_recursion_limit(shell: Shell, vfs: VirtualFileSystem) -> None:
+    vfs.write_file("/tmp/a.sh", "sh /tmp/b.sh\n", "/")
+    vfs.write_file("/tmp/b.sh", "sh /tmp/a.sh\n", "/")
+    result = await shell.execute("sh /tmp/a.sh")
+    assert result.exit_code == 1
+    assert result.output == "bash: maximum recursion depth exceeded\n"
+
+
 async def test_nonexistent_path_execution_returns_127(shell: Shell) -> None:
     result = await shell.execute("./nonexistent")
     assert result.exit_code == 127
